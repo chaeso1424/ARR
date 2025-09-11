@@ -129,7 +129,7 @@ const DashAnalytics = () => {
   // ✅ 백엔드 기본 URL (환경변수로 오버라이드 가능)
   const API_BASE =
     (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_BASE_URL) ||
-    "http://127.0.0.1:5000";
+    "https://artcokr.org";
 
   // ✅ 토큰 자동 첨부 + 절대경로 보정
   const authedFetch = async (url, options = {}) => {
