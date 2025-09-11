@@ -40,7 +40,7 @@ export const routes = [
     routes: [
       { path: '/app/dashboard/analytics', element: lazy(() => import('./views/dashboard')), guard: RequireAuth },
       { path: '*', element: () => (<Navigate to={isAuthed() ? '/app/dashboard/analytics' : '/auth/signin-1'} replace />) },
-      { path: '/app/Logs', element: lazy(() => import('./views/logs')), guard: RequireAuth }
+      { path: '/app/logs', element: lazy(() => import('./views/logs')), guard: RequireAuth }
     ]
   },
 ];
