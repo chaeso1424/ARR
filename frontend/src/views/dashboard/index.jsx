@@ -78,8 +78,6 @@ const DashAnalytics = () => {
     setBalanceChart(buildAccountBalanceChart({ labels, values }));
   };
 
-  useEffect(() => { fetchSeries(); }, []); // 최초 1회
-
   useEffect(() => { fetchSeries(gran, range); }, [gran, range]); // 토글/범위 변경 시
 
   useEffect(() => {
