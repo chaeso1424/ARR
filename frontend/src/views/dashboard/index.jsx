@@ -70,7 +70,7 @@ const DashAnalytics = () => {
   const [balanceChart, setBalanceChart] = useState(null);
   const fetchSeries = async (g = gran, r = range) => {
     const q = g === 'd' ? `granularity=d&days=${r}` : `granularity=w&weeks=${r}`;
-    const res = await fetch(`/balance/series?${q}`);
+    const res = await fetch(`/api/balance/series?${q}`);
     if (!res.ok) throw new Error(await res.text());
     const { series } = await res.json();
     const labels = series.map(s => s.date);
@@ -85,7 +85,7 @@ const DashAnalytics = () => {
 
     async function load() {
       try {
-        const res = await fetch(`/trades/summary?window=${tradesWindow}`, {
+        const res = await fetch(`/api/trades/summary?window=${tradesWindow}`, {
           cache: 'no-store'
         });
         const data = await res.json();
@@ -133,7 +133,7 @@ const DashAnalytics = () => {
   const authedFetch = async (url, options = {}) => {
     const token = localStorage.getItem('auth_token');
     const isAbsolute = /^https?:\/\//i.test(url);
-    const fullUrl = isAbsolute ? url : new URL(url, API_BASE.endsWith('/') ? API_BASE : API_BASE + '/').toString();
+    const fullUrl = isAbsolute ? url : API_BASE + url;
 
     const mergedHeaders = {
       ...(options.headers || {}),
@@ -142,13 +142,12 @@ const DashAnalytics = () => {
 
     return fetch(fullUrl, { ...options, headers: mergedHeaders });
   };
-
   // ─────────────────────────────────────────────────────────────────────────────
   // 봇 목록 불러오기 & 기본 선택
   // ─────────────────────────────────────────────────────────────────────────────
   const loadBots = async () => {
     try {
-      const res = await authedFetch('/bots'); // ✅ 토큰 추가
+      const res = await authedFetch('/api/bots'); // ✅ 토큰 추가
       if (!res.ok) throw new Error(await res.text());
       const list = await res.json();
       setBots(list || []);
@@ -168,7 +167,7 @@ const DashAnalytics = () => {
     // 글로벌 스냅샷 1회 (초기 로딩 체감 개선)
     (async () => {
       try {
-        const r = await authedFetch('/account/summary'); // ✅ 토큰 추가
+        const r = await authedFetch('/api/account/summary'); // ✅ 토큰 추가
         if (r.ok) applySummary(await r.json());
         else setError(`summary HTTP ${r.status}`);
       } catch (e) {
@@ -184,7 +183,7 @@ const DashAnalytics = () => {
   const loadConfig = async (botId) => {
     if (!botId) return;
     try {
-      const res = await authedFetch(`/bots/${encodeURIComponent(botId)}/config`); // ✅ 토큰 추가
+      const res = await authedFetch(`/api/bots/${encodeURIComponent(botId)}/config`); // ✅ 토큰 추가
       if (!res.ok) throw new Error(await res.text());
       const cfg = await res.json();
 
@@ -236,7 +235,7 @@ const DashAnalytics = () => {
     try {
       // ⚠️ SSE는 헤더에 토큰을 못 실음 → 쿼리스트링으로 전달(백엔드가 지원해야 함)
       const token = localStorage.getItem('auth_token');
-      const url = token ? `/account/summary/stream?token=${encodeURIComponent(token)}` : '/account/summary/stream';
+      const url = token ? `/api/account/summary/stream?token=${encodeURIComponent(token)}` : '/api/account/summary/stream';
       const es = new EventSource(url);
       esRef.current = es;
       setLoading(true);
@@ -248,10 +247,10 @@ const DashAnalytics = () => {
       };
       es.onerror = () => {
         closeES();
-        startPolling('/account/summary'); // 글로벌 SSE 실패 → 글로벌 폴링
+        startPolling('/api/account/summary'); // 글로벌 SSE 실패 → 글로벌 폴링
       };
     } catch {
-      startPolling('/account/summary'); // ES 생성 실패 → 글로벌 폴링
+      startPolling('/api/account/summary'); // ES 생성 실패 → 글로벌 폴링
     }
   };
 
@@ -260,7 +259,7 @@ const DashAnalytics = () => {
     stopPolling();
     try {
       const token = localStorage.getItem('auth_token');
-      const urlBase = `/account/summary/stream`;
+      const urlBase = `/api/account/summary/stream`;
       const url = token ? `${urlBase}?token=${encodeURIComponent(token)}` : urlBase;
 
       const es = new EventSource(url);
@@ -276,7 +275,7 @@ const DashAnalytics = () => {
       es.onerror = async () => {
         closeES();
         try {
-          const r = await authedFetch(`/account/summary`);
+          const r = await authedFetch(`/api/account/summary`);
           if (r.ok) {
             applySummary(await r.json());
           }
@@ -285,7 +284,7 @@ const DashAnalytics = () => {
       };
     } catch {
       // ES 생성 실패시 폴링
-      startPolling('/account/summary');
+      startPolling('/api/account/summary');
     }
   };
 
@@ -330,7 +329,7 @@ const DashAnalytics = () => {
 
     const tick = async () => {
       try {
-        const r = await authedFetch(`/bots/${encodeURIComponent(currentBotId)}/status`); // ✅ 토큰 추가
+        const r = await authedFetch(`/api/bots/${encodeURIComponent(currentBotId)}/status`); // ✅ 토큰 추가
         if (r.ok) {
           const j = await r.json();
           if (!stop) setBotStatus(j);
@@ -401,7 +400,7 @@ const DashAnalytics = () => {
       dca_config: tiers        // [[gap, usdt], ...]
     };
     try {
-      const res = await authedFetch(`/bots/${encodeURIComponent(currentBotId)}/config`, { // ✅ 토큰 추가
+      const res = await authedFetch(`/api/bots/${encodeURIComponent(currentBotId)}/config`, { // ✅ 토큰 추가
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
@@ -419,7 +418,7 @@ const DashAnalytics = () => {
   const startBot = async () => {
     if (!currentBotId) return;
     try {
-      const r = await authedFetch(`/bots/${encodeURIComponent(currentBotId)}/start`, { method: 'POST' }); // ✅
+      const r = await authedFetch(`/api/bots/${encodeURIComponent(currentBotId)}/start`, { method: 'POST' }); // ✅
       if (!r.ok) throw new Error(await r.text());
       loadBots();
       alert('Bot started.');
@@ -432,7 +431,7 @@ const DashAnalytics = () => {
   const stopBot = async () => {
     if (!currentBotId) return;
     try {
-      const r = await authedFetch(`/bots/${encodeURIComponent(currentBotId)}/stop`, { method: 'POST' }); // ✅
+      const r = await authedFetch(`/api/bots/${encodeURIComponent(currentBotId)}/stop`, { method: 'POST' }); // ✅
       if (!r.ok) throw new Error(await res.text());
       loadBots();
       alert('Bot stopped.');
@@ -444,7 +443,7 @@ const DashAnalytics = () => {
 
   const createBot = async () => {
     try {
-      const r = await authedFetch('/bots', { method: 'POST' }); // ✅
+      const r = await authedFetch('/api/bots', { method: 'POST' }); // ✅
       if (!r.ok) throw new Error(await r.text());
       const j = await r.json();
       await loadBots();
@@ -462,12 +461,12 @@ const DashAnalytics = () => {
   useEffect(() => {
     (async () => {
       try {
-        await fetch('/account/summary').catch(() => {});
+        await fetch('/api/account/summary').catch(() => {});
         const qs = gran === 'd'
           ? `granularity=d&days=${range}`
           : `granularity=w&weeks=${range}`;
 
-        const res = await fetch(`/balance/series?${qs}`);
+        const res = await fetch(`/api/balance/series?${qs}`);
         if (!res.ok) throw new Error(await res.text());
 
         const { series } = await res.json();
@@ -485,7 +484,7 @@ const DashAnalytics = () => {
     (async () => {
       try {
         const res = await fetch(
-          `/profit/summary?window=${profitWindow}&baseline=${baseline}`,
+          `/api/profit/summary?window=${profitWindow}&baseline=${baseline}`,
           { cache: 'no-store' }
         );
         const data = await res.json();
@@ -505,7 +504,7 @@ const DashAnalytics = () => {
       let aborted = false;
       (async () => {
         try {
-          const res = await fetch(`/profit/kpi?baseline=${baseline}`, { cache: 'no-store' });
+          const res = await fetch(`/api/profit/kpi?baseline=${baseline}`, { cache: 'no-store' });
           const json = await res.json();
           if (!aborted) setKpi(json);
         } catch (e) {
