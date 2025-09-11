@@ -1,0 +1,39 @@
+# ==========================
+# Python / Backend
+# ==========================
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 환경 변수 & 로그
+.env
+logs/
+logs.txt
+
+# 데이터 (캐시, 런타임)
+data/
+*.sqlite3
+*.db
+
+# ==========================
+# Node / Frontend
+# ==========================
+node_modules/
+dist/
+.yarn/
+.yarnrc.yml
+.yarn/*
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+
+# ==========================
+# 공통 불필요 파일
+# ==========================
+.DS_Store
+Thumbs.db
+*.log
+*.lock
