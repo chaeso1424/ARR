@@ -459,27 +459,6 @@ const DashAnalytics = () => {
   // ─────────────────────────────────────────────────────────────────────────────
 
   useEffect(() => {
-    (async () => {
-      try {
-        await fetch('/api/account/summary').catch(() => {});
-        const qs = gran === 'd'
-          ? `granularity=d&days=${range}`
-          : `granularity=w&weeks=${range}`;
-
-        const res = await fetch(`/api/balance/series?${qs}`);
-        if (!res.ok) throw new Error(await res.text());
-
-        const { series } = await res.json();
-        const labels = series.map(s => s.date);
-        const values = series.map(s => s.balance);
-        setBalanceChart(buildAccountBalanceChart({ labels, values }));
-      } catch (e) {
-        console.warn('failed to load balance series', e);
-      }
-    })();
-  }, [gran, range]);
-
-  useEffect(() => {
     let aborted = false;
     (async () => {
       try {
