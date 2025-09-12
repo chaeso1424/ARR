@@ -28,6 +28,16 @@ BASE = os.getenv("BINGX_BASE", "https://open-api.bingx.com")
 POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "HEDGE").upper()  # HEDGE or ONEWAY
 
 
+_DEFAULT_SNAP = {
+    "asset": "USDT",
+    "balance": 0.0,
+    "equity": 0.0,
+    "available_margin": 0.0,
+    "realised_profit": 0.0,
+    "unrealized_profit": 0.0,
+}
+
+
 # ---- 타임아웃/세션/재시도 기본값 ----
 CONNECT_TIMEOUT = int(os.getenv("BINGX_CONNECT_TIMEOUT", "10"))   # 5 -> 10
 READ_TIMEOUT    = int(os.getenv("BINGX_READ_TIMEOUT", "15"))      # 5 -> 15
@@ -138,6 +148,13 @@ def _start_server_time_sync_daemon():
 _start_server_time_sync_daemon()
 
 # ---------- low-level utils ----------
+def _safe_snap(self, min_ttl: float = 5.0) -> dict:
+    """캐시/쿨다운/에러에 상관없이 항상 dict를 반환."""
+    snap = self._get_snapshot_cached(min_ttl=min_ttl)
+    if isinstance(snap, dict):
+        return snap
+    return _DEFAULT_SNAP.copy()
+
 def _ts():
     """서버 오프셋 보정된 epoch(ms)"""
     return int(time.time() * 1000) + _SERVER_OFFSET_MS
@@ -653,16 +670,16 @@ class BingXClient:
 
     
     def get_accountbalance_usdt(self) -> float:
-        snap = self._get_snapshot_cached(min_ttl=5.0)
-        return float(snap.get("balance", 0.0))
+        snap = self._safe_snap(min_ttl=5.0)
+        return float(snap.get("balance", 0.0) or 0.0)
 
     def get_equity_usdt(self) -> float:
-        snap = self._get_snapshot_cached(min_ttl=5.0)
-        return float(snap.get("equity", 0.0))
+        snap = self._safe_snap(min_ttl=5.0)
+        return float(snap.get("equity", 0.0) or 0.0)
 
     def get_available_usdt(self) -> float:
-        snap = self._get_snapshot_cached(min_ttl=5.0)
-        return float(snap.get("available_margin", 0.0))
+        snap = self._safe_snap(min_ttl=5.0)
+        return float(snap.get("available_margin", 0.0) or 0.0)
 
 
 
