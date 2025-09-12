@@ -10,8 +10,16 @@ from dotenv import load_dotenv
 from pathlib import Path
 from collections import deque
 from functools import wraps
-from flask import Flask, request, jsonify, Response, stream_with_context
+from flask import Flask, request, jsonify, Response, stream_with_context, g
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from time import perf_counter
+import time as _time
+
+_EXEC = ThreadPoolExecutor(max_workers=4)
+LAST_WEEKLY = {"series": [], "ts": 0.0}
+LAST_DAILY  = {"series": [], "ts": 0.0}
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 0) 환경 로드
@@ -91,6 +99,22 @@ USERS = {
 
 client = BingXClient()
 BOTS: dict[str, dict] = {}  # { bot_id: {"cfg": BotConfig, "state": BotState, "runner": BotRunner} }
+
+@app.before_request
+def _diag_t0():
+    g.__t0 = perf_counter()
+    try:
+        print(f"[BR] {request.method} {request.path} start", flush=True)
+    except Exception:
+        pass
+
+@app.after_request
+def _diag_t1(resp):
+    try:
+        dt = (perf_counter() - getattr(g, "__t0", perf_counter())) * 1000
+        print(f"[AR] {request.method} {request.path} -> {resp.status_code} {dt:.1f}ms", flush=True)
+    finally:
+        return resp
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 3) 인증(토큰)
@@ -255,18 +279,41 @@ start_snapshot_daemon_once()
 
 @app.get("/api/balance/series")
 def api_balance_series():
-    gran = request.args.get("granularity", "w")  # 'd' or 'w'
+    gran = (request.args.get("granularity") or "w").lower()
     if gran == "d":
-        days = request.args.get("days", "30")
-        try: days = max(1, int(days))
-        except: days = 30
-        return jsonify({"granularity": "d", "series": get_daily_series(days)})
+        try:
+            days = max(1, int(request.args.get("days", "30")))
+        except:
+            days = 30
+        series, stale = _nonblocking_call(get_daily_series, days, timeout=0.8, cache=LAST_DAILY)
+        return jsonify({"granularity": "d", "series": series, "stale": stale})
     else:
-        weeks = request.args.get("weeks", "12")
-        try: weeks = max(1, int(weeks))
-        except: weeks = 12
-        return jsonify({"granularity": "w", "series": get_weekly_series(weeks)})
+        try:
+            weeks = max(1, int(request.args.get("weeks", "12")))
+        except:
+            weeks = 12
+        series, stale = _nonblocking_call(get_weekly_series, weeks, timeout=0.8, cache=LAST_WEEKLY)
+        return jsonify({"granularity": "w", "series": series, "stale": stale})
     
+def _nonblocking_call(func, *args, timeout=0.8, cache=None):
+    fut = _EXEC.submit(func, *args)
+    try:
+        res = fut.result(timeout=timeout)
+        if cache is not None and res is not None:
+            cache["series"] = res
+            cache["ts"] = _time.time()
+        return res, False  # (결과, stale=False)
+    except TimeoutError:
+        # 느리면 즉시 캐시 반환(있으면)
+        if cache and cache["series"]:
+            return cache["series"], True
+        # 캐시 없으면 빈값
+        return [], True
+    except Exception as e:
+        print("[series] call error:", e)
+        if cache and cache["series"]:
+            return cache["series"], True
+        return [], True
 # ───────────────────────────────────────────────────────────────────────────────
 # 6) “총 거래량 + 체결건수 + (신규 진입 vs DCA) 도넛” / profit chart
 # ───────────────────────────────────────────────────────────────────────────────
@@ -379,6 +426,16 @@ def api_profit_kpi():
 # ───────────────────────────────────────────────────────────────────────────────
 # 6) 계정 요약(SSE/스냅샷)
 # ───────────────────────────────────────────────────────────────────────────────
+
+_LAST_WS_SAVE = 0.0
+def _maybe_upsert_weekly_async(balance, min_interval=300):  # 5분 간격 이상일 때만
+    global _LAST_WS_SAVE
+    now = _time.time()
+    if now - _LAST_WS_SAVE < min_interval:
+        return
+    _LAST_WS_SAVE = now
+    threading.Thread(target=lambda: upsert_weekly_snapshot(balance), daemon=True).start()
+    
 @app.get("/api/account/summary")
 def account_summary():
     global LAST_SUMMARY
@@ -388,7 +445,7 @@ def account_summary():
 
         # 주간 스냅샷 저장 (여기서도 None 안전)
         try:
-            upsert_weekly_snapshot(res["balance"])
+            _maybe_upsert_weekly_async(res["balance"])
         except Exception as e:
             print("weekly snapshot save failed:", e)
 
