@@ -78,6 +78,8 @@ const DashAnalytics = () => {
     setBalanceChart(buildAccountBalanceChart({ labels, values }));
   };
 
+  useEffect(() => { fetchSeries(); }, []); // 최초 1회
+
   useEffect(() => { fetchSeries(gran, range); }, [gran, range]); // 토글/범위 변경 시
 
   useEffect(() => {
@@ -124,16 +126,39 @@ const DashAnalytics = () => {
   // ─────────────────────────────────────────────────────────────────────────────
   // ✅ 토큰 자동 첨부 fetch 래퍼
   // ─────────────────────────────────────────────────────────────────────────────
-  // ✅ 백엔드 기본 URL (환경변수로 오버라이드 가능)
-  const API_BASE =
+  // ✅ 백엔드 기본 URL (끝 슬래시 제거)
+  const API_BASE = (
     (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_BASE_URL) ||
-    "https://artcokr.org";
+    "http://127.0.0.1:5000"
+  ).replace(/\/+$/, '');
 
-  // ✅ 토큰 자동 첨부 + 절대경로 보정
+  // ✅ URL 정규화: API_BASE에 /api가 있든 없든, 인자에 /api를 붙이든 말든 중복 제거
+  function buildApiUrl(url) {
+    if (/^https?:\/\//i.test(url)) return url;                 // 이미 절대 URL이면 그대로
+
+    // 인자에서 선행 슬래시 1개로 정규화
+    let path = '/' + String(url || '').replace(/^\/+/, '');
+
+    const baseHasApi = /\/api$/i.test(API_BASE);
+    const pathStartsApi = /^\/api(\/|$)/i.test(path);
+
+    // (1) BASE가 /api로 끝나고, (2) path도 /api로 시작하면 → path 쪽 /api 제거
+    if (baseHasApi && pathStartsApi) {
+      path = path.replace(/^\/api/i, '') || '/';
+    }
+
+    // BASE가 /api로 안끝나고, path도 /api로 안시작하면 → /api 접두어를 보장
+    if (!baseHasApi && !pathStartsApi) {
+      path = '/api' + path;
+    }
+
+    return API_BASE + path;
+  }
+
+  // ✅ 토큰 자동 첨부 fetch
   const authedFetch = async (url, options = {}) => {
     const token = localStorage.getItem('auth_token');
-    const isAbsolute = /^https?:\/\//i.test(url);
-    const fullUrl = isAbsolute ? url : API_BASE + url;
+    const fullUrl = buildApiUrl(url);
 
     const mergedHeaders = {
       ...(options.headers || {}),
@@ -650,7 +675,7 @@ const DashAnalytics = () => {
                   <Card>
                     <Card.Body>
                       <Row className="align-items-start card-title-row">
-                        <Col sm="auto"><span>Trades</span></Col>
+                        <Col sm="auto"><span>SExxxxxx</span></Col>
                         <Col className="text-end">
                           {/* 기간 토글 (선택) */}
                           <div className="mb-2">

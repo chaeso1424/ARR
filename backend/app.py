@@ -59,6 +59,26 @@ NO_CACHE_HEADERS = {
     "Expires": "0",
 }
 
+DEFAULT_SUMMARY = {
+    "asset": "USDT",
+    "balance": 0.0,
+    "equity": 0.0,
+    "available_margin": 0.0,
+}
+# 파일 상단에 추가 (DEFAULT_SUMMARY 아래쯤)
+LAST_SUMMARY = None
+
+def _summary_from_snap(snap):
+    """snap(dict|None)을 안전하게 요약 dict로 변환하고, 숫자는 float로 정규화"""
+    d = snap if isinstance(snap, dict) else {}
+    return {
+        "currency": d.get("asset", "USDT"),
+        "balance": float(d.get("balance", 0) or 0),
+        "equity": float(d.get("equity", 0) or 0),
+        "available_margin": float(d.get("available_margin", 0) or 0),
+    }
+
+
 # ───────────────────────────────────────────────────────────────────────────────
 # 2) Flask 앱/전역
 # ───────────────────────────────────────────────────────────────────────────────
@@ -214,9 +234,10 @@ def _daily_snapshot_worker():
     while True:
         try:
             snap = client._get_snapshot_cached(min_ttl=0.0)
-            bal = float(snap.get("balance", 0.0) or 0.0)
+            summ = _summary_from_snap(snap)  # None이어도 안전
+            bal = summ["balance"]
             upsert_daily_snapshot(bal)
-            upsert_weekly_snapshot(bal)  # 주간도 최신값 유지
+            upsert_weekly_snapshot(bal)
             print("[snapshot] daily+weekly saved", bal)
         except Exception as e:
             print("[snapshot] failed:", e)
@@ -360,42 +381,55 @@ def api_profit_kpi():
 # ───────────────────────────────────────────────────────────────────────────────
 @app.get("/api/account/summary")
 def account_summary():
-    snap = client._get_snapshot_cached(min_ttl=5.0)
-
-    # 이번 주(UTC) 스냅샷 upsert (에러가 나도 응답은 진행)
+    global LAST_SUMMARY
     try:
-        upsert_weekly_snapshot(float(snap.get("balance", 0.0) or 0.0))
-    except Exception as e:
-        print("weekly snapshot save failed:", e)
+        snap = client._get_snapshot_cached(min_ttl=5.0)
+        res = _summary_from_snap(snap)
 
-    return jsonify({
-        "currency": snap.get("asset", "USDT"),
-        "balance": snap.get("balance", 0.0),
-        "equity": snap.get("equity", 0.0),
-        "available_margin": snap.get("available_margin", 0.0),
-    })
+        # 주간 스냅샷 저장 (여기서도 None 안전)
+        try:
+            upsert_weekly_snapshot(res["balance"])
+        except Exception as e:
+            print("weekly snapshot save failed:", e)
+
+        # 성공값은 캐시에 보관
+        LAST_SUMMARY = res
+        return jsonify(res), 200
+
+    except Exception as e:
+        # 예외가 나도 마지막 성공값 또는 기본값으로 200 응답
+        if LAST_SUMMARY:
+            return jsonify(LAST_SUMMARY), 200
+        return jsonify(_summary_from_snap(None)), 200
 
 
 @app.get("/api/account/summary/stream")
 def account_summary_stream():
     @stream_with_context
     def gen():
+        global LAST_SUMMARY
         yield "retry: 10000\n\n"
         last = None
         while True:
             try:
                 snap = client._get_snapshot_cached(min_ttl=5.0)
-                if snap != last:
-                    yield f"data: {json.dumps(snap)}\n\n"
-                    last = snap
+                res = _summary_from_snap(snap)
+                if res != last:
+                    LAST_SUMMARY = res
+                    yield f"data: {json.dumps(res)}\n\n"
+                    last = res
                 else:
                     yield ": keep-alive\n\n"
             except Exception as e:
+                # 에러 시에도 끊지 말고 마지막 값 또는 기본값으로 유지
                 yield f": err {str(e)}\n\n"
+                fallback = LAST_SUMMARY or _summary_from_snap(None)
+                yield f"data: {json.dumps(fallback)}\n\n"
             time.sleep(10)
 
     return Response(gen(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 7) 로그 API (A안: 봇별 파일)
