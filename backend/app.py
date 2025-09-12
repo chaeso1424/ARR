@@ -1,16 +1,26 @@
 # app.py — A안(봇별 로그) 정리본
 import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 0) 환경 로드
+# ───────────────────────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+load_dotenv()  # 현재 작업 디렉토리 기준
+
 import json, math
 import re
 import jwt
 import datetime as dt
 import threading
 import time
-from pathlib import Path
 from collections import deque
 from functools import wraps
 from flask import Flask, request, jsonify, Response, stream_with_context
-from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from utils.balance_store import (
@@ -26,14 +36,6 @@ from models.state import BotState
 from services.bingx_client import BingXClient, BASE, _req_get, _ts
 from bot.runner import BotRunner
 from flask_cors import CORS
-
-
-# ───────────────────────────────────────────────────────────────────────────────
-# 0) 환경 로드
-# ───────────────────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
-load_dotenv()  # 현재 작업 디렉토리 기준
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 1) 경로/상수
