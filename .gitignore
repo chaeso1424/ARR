@@ -17,7 +17,7 @@ data/
 *.sqlite3
 *.db
 
-frontend
+frontend/
 
 # ==========================
 # 공통 불필요 파일
