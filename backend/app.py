@@ -581,66 +581,6 @@ def _apply_exchange_settings_async(cfg):
     except Exception as e:
         log(f"⚠️ config 적용 실패({getattr(cfg,'symbol',None)}): {e}")
 
-def _get_status_live(cfg, state, timeout_each=0.7):
-    s_all = Span("status_live")
-    # 병렬 제출
-    fut_ppqp = _EXEC.submit(lambda: client.get_symbol_filters(cfg.symbol))
-    fut_mark = _EXEC.submit(lambda: float(client.get_mark_price(cfg.symbol)))
-    fut_pos  = _EXEC.submit(lambda: client.position_info(cfg.symbol, cfg.side))
-    fut_lev  = _EXEC.submit(lambda: client.get_current_leverage(cfg.symbol, cfg.side))
-
-    # 개별 타임아웃 수집(타임아웃/에러는 None)
-    def _get(f, name):
-        s = Span(name)
-        try:
-            val = f.result(timeout=timeout_each)
-            return val
-        except Exception as e:
-            print(f"[status] {name} timeout/error: {e}")
-            return None
-        finally:
-            d = s.end()
-            # 50ms 넘는 것만 찍어서 노이즈 감소
-            if d >= 50:
-                print(f"[status] {name} {d:.1f}ms")
-
-    ppqp = _get(fut_ppqp, 'ppqp') or (4, 0)
-    try:
-        pp, qp = int(ppqp[0]), int(ppqp[1])
-    except:
-        pp, qp = 4, 0
-
-    mark = _get(fut_mark, 'mark')
-    if mark is not None:
-        try: mark = float(mark)
-        except: mark = None
-
-    pos = _get(fut_pos, 'pos') or (0.0, 0.0)
-    try:
-        avg, qty = float(pos[0] or 0.0), float(pos[1] or 0.0)
-    except:
-        avg, qty = 0.0, 0.0
-
-    exch_lev = _get(fut_lev, 'lev')
-
-    d_all = s_all.end()
-    if d_all >= 100:
-        print(f"[status] aggregate {d_all:.1f}ms")
-
-    return {
-        "running": state.running,
-        "repeat_mode": getattr(state, "repeat_mode", False),
-        "tp_order_id": getattr(state, "tp_order_id", None),
-        "symbol": cfg.symbol,
-        "side": cfg.side,
-        "price_precision": pp,
-        "position_avg_price": avg,
-        "position_qty": qty,
-        "mark_price": mark,
-        "exchange_leverage": exch_lev,
-        "cfg_leverage": cfg.leverage,
-        "dca_config": cfg.dca_config,
-    }
 
 @app.get("/api/bots")
 def list_bots():
@@ -776,17 +716,29 @@ def status_bot(bot_id):
     bot = get_or_create_bot(bot_id)
     cfg = bot["cfg"]; state = bot["state"]
 
-    now = _time.time()
-    cache = STATUS_CACHE.get(bot_id)
-    # 캐시가 아주 신선하면 바로 리턴
-    if cache and (now - cache["ts"] <= STATUS_TTL):
-        return jsonify(cache["data"])
+    try:    pp, qp = client.get_symbol_filters(cfg.symbol)
+    except: pp, qp = 4, 0
+    try:    mark = float(client.get_mark_price(cfg.symbol))
+    except: mark = None
 
-    # 최신값 시도(병렬 + 타임아웃)
-    data = _get_status_live(cfg, state)
-    # 캐시 업데이트
-    STATUS_CACHE[bot_id] = {"ts": now, "data": data}
-    return jsonify(data)
+    avg, qty = client.position_info(cfg.symbol, cfg.side)
+    exch_lev = client.get_current_leverage(cfg.symbol, cfg.side)
+
+    out = {
+        "running": state.running,
+        "repeat_mode": getattr(state, "repeat_mode", False),
+        "tp_order_id": getattr(state, "tp_order_id", None),
+        "symbol": cfg.symbol,
+        "side": cfg.side,
+        "price_precision": pp,
+        "position_avg_price": avg,
+        "position_qty": qty,
+        "mark_price": mark,
+        "exchange_leverage": exch_lev,
+        "cfg_leverage": cfg.leverage,
+        "dca_config": cfg.dca_config,
+    }
+    return jsonify(out)
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 12) 디버그 & 로그인
