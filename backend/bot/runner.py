@@ -58,6 +58,8 @@ class BotRunner:
 
     def stop(self):
         self._stop = True
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
 
     # ---------- helpers ----------
     def _now(self) -> float:
@@ -256,584 +258,543 @@ class BotRunner:
 
     # ---------- main loop ----------
     def _run(self) -> None:
+        """
+        Main loop with loop-based self-healing. We do NOT recurse on error anymore.
+        This prevents momentary `state.running = False` flickers.
+        """
         try:
             while not self._stop:
-                # 1) 정밀도/스펙 동기화
                 try:
-                    pp, qp = self.client.get_symbol_filters(self.cfg.symbol)
-                    self.cfg.price_precision = pp
-                    self.cfg.qty_precision = qp
-                    self._log(f"ℹ️ precision synced: price={pp}, qty={qp}")
-                except Exception as e:
-                    self._log(f"⚠️ precision sync failed: {e}")
-                    pp, qp = 4, 0
-
-                spec = self.client.get_contract_spec(self.cfg.symbol)
-                pp = int(spec.get("pricePrecision", pp))
-                qp = int(spec.get("quantityPrecision", qp))
-                contract = float(spec.get("contractSize", 1.0)) or 1.0
-                min_qty = float(spec.get("minQty", 0.0))
-                step = float(spec.get("qtyStep") or (1.0 if qp == 0 else 10 ** (-qp)))
-                if step <= 0:
-                    step = 1.0 if qp == 0 else 10 ** (-qp)
-                self._log(f"ℹ️ spec: contractSize={contract}, minQty={min_qty}, qtyStep={step}, pp={pp}, qp={qp}")
-
-                side = self.cfg.side.upper()
-                mark = float(self.client.get_mark_price(self.cfg.symbol))
-
-                # ---- 현재 포지션 파악(attach 모드 여부 선결정) ----
-                try:
-                    pre_avg, pre_qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
-                except Exception:
-                    pre_avg, pre_qty = 0.0, 0.0
-                min_live_qty = max(float(min_qty or 0.0), float(step or 0.0))
-                attach_mode = (float(pre_qty) >= (min_live_qty * ZERO_EPS_FACTOR))
-                # attach_mode 상태를 기록한다.
-                self._attach_mode = attach_mode
-
-                # 0) 가용 USDT 체크 (attach 모드면 패스 가능)
-                try:
-                    av = float(self.client.get_available_usdt())
-                    if av < 0.99:  # 1차 조회 결과가 0에 가까움
-                        self._log("⚠️ 가용 USDT 0 → 재측정 시도")
-                        time.sleep(1)  # 1초 대기 후 재조회
-                        av = float(self.client.get_available_usdt())
-                except Exception as e:
-                    self._log(f"❌ 가용잔고 조회 실패: {e}")
-                    av = 0.0
-
-                budget = sum(float(usdt) for _, usdt in self.cfg.dca_config)
-
-                if av < 0.99 and not attach_mode:
-                    self._log("⛔ 가용 USDT 없음 → 종료")
-                    break
-
-                # 1.6) === 사전 예산 점검 (attach 모드는 스킵) ===
-                if not attach_mode:
-                    required, plan = self._estimate_required_margin(side, mark, spec, pp, step)
+                    # 1) 정밀도/스펙 동기화
                     try:
-                        av = float(self.client.get_available_usdt())
-                    except Exception:
-                        pass
-                    self.state.budget_ok = av + 1e-9 >= required
-                    self.state.budget_required = required
-                    self.state.budget_available = av
-                    if av + 1e-9 < required:
-                        gap = required - av
-                        self._log("⛔ 예산 부족: 모든 진입 주문에 필요한 증거금이 가용 USDT보다 큽니다.")
-                        self._log(f"   필요≈{required:.4f} USDT, 가용≈{av:.4f} USDT, 부족≈{gap:.4f} USDT")
-                        for idx, x in enumerate(plan, start=1):
-                            self._log(
-                                f"   · {idx:02d} {x['type']}: price={x['price']} qty={x['qty']} → 증거금≈{x['usdt']:.4f} USDT"
-                            )
-                        break
-                    else:
-                        self._log(f" 예산 확인 OK: 필요≈{required:.4f} USDT ≤ 가용≈{av:.4f} USDT")
-
-                # === 레버리지 검증 (자동조정 없음)
-                lev_now = self.client.get_current_leverage(self.cfg.symbol, self.cfg.side)
-                if lev_now is not None:
-                    want = float(self.cfg.leverage)
-                    diff = abs(lev_now - want) / max(want, 1.0)
-                    if diff > 0.02:
-                        self._log(f"⛔ 레버리지 불일치: 설정={want}x, 거래소={lev_now}x → 수량/증거금 오차 발생")
-                        self._log("   거래소 앱/웹에서 해당 심볼의 레버리지를 설정값과 동일하게 맞춘 뒤 다시 시작하세요.")
-                        break
-                else:
-                    self._log("ℹ️ 현재 포지션이 없어 레버리지 조회값 없음 → 주문 후 다시 검증 예정")
-
-                # === attach 모드: 시장가/DCA 스킵, TP만 확보 ===
-                if attach_mode:
-                    self._log(f" 기존 포지션 연결 모드: qty={pre_qty}, avg={pre_avg} → DCA/시장가 스킵, TP 확보")
-                    self.state.position_avg_price = pre_avg
-                    self.state.position_qty = pre_qty
-                    # DCA 감지를 위한 초기 스냅
-                    try:
-                        self._prev_qty_snap = float(self.state.position_qty or 0.0)
-                    except Exception:
-                        self._prev_qty_snap = 0.0
-                    
-                    last_entry = float(pre_avg or 0.0)
-                    last_tp_price = self._last_tp_price
-                    last_tp_qty = self._last_tp_qty
-                else:
-                    entry_side = "BUY" if side == "BUY" else "SELL"
-                    entry_pos  = "LONG" if side == "BUY" else "SHORT"
-
-                    ok = self._cancel_tracked_limits(
-                        want_side=entry_side,
-                        want_pos=entry_pos,
-                        attempts=3,
-                        verify_sleep=0.4
-                    )
-                    if not ok:
-                        self._log("⚠️ 엔트리 전 오류로 인한 잔여 리밋 정리 실패 ⚠️")
-                        break
-
-                    # 2) 1차 시장가 진입
-                    self._cancel_tracked_limits()
-                    first_usdt = float(self.cfg.dca_config[0][1])
-                    target_notional = first_usdt * float(self.cfg.leverage)
-                    raw_qty = target_notional / max(mark * contract, 1e-12)
-                    qty = floor_to_step(raw_qty, step)
-                    if qty < (min_qty or step):
-                        self._log(f"⚠️ 1차 수량이 최소수량 미달(raw={raw_qty}) → {max(min_qty, step)}로 보정")
-                        qty = max(min_qty, step)
-                    try:
-                        oid = self.client.place_market(self.cfg.symbol, side, qty)
+                        pp, qp = self.client.get_symbol_filters(self.cfg.symbol)
+                        self.cfg.price_precision = pp
+                        self.cfg.qty_precision = qp
+                        self._log(f"ℹ️ precision synced: price={pp}, qty={qp}")
                     except Exception as e:
-                        msg = str(e)
-                        if "80001" in msg:
-                            # 잔액부족이면 이번 사이클은 종료(다음 반복에서 예산 다시 체크)
-                            self._log(f"❌ 시장가 진입 실패: {e}")
-                            break
-                        elif "timed out" in msg.lower():
-                            # Read Timeout류 → 봇 종료하지 말고 다음 사이클로 넘어가 attach 판단
-                            self._log(f"⚠️ 시장가 주문 타임아웃: {e} → attach 모드로 재시도")
-                            continue
-                        else:
-                            raise
-                    if not oid:
-                        raise RuntimeError("market order failed: no orderId")
-                    self._log(f" 1차 시장가 진입 주문: {oid} (투입≈{first_usdt} USDT, qty={qty})")
-                    time.sleep(1)  # ← 거래소 포지션 데이터 반영 대기
-                    self._refresh_position()  # → state.position_avg_price, state.position_qty 갱신
-                    # === ENTRY 이벤트 집계 ===
+                        self._log(f"⚠️ precision sync failed: {e}")
+                        pp, qp = 4, 0
+
+                    spec = self.client.get_contract_spec(self.cfg.symbol)
+                    pp = int(spec.get("pricePrecision", pp))
+                    qp = int(spec.get("quantityPrecision", qp))
+                    contract = float(spec.get("contractSize", 1.0)) or 1.0
+                    min_qty = float(spec.get("minQty", 0.0))
+                    step = float(spec.get("qtyStep") or (1.0 if qp == 0 else 10 ** (-qp)))
+                    if step <= 0:
+                        step = 1.0 if qp == 0 else 10 ** (-qp)
+                    self._log(f"ℹ️ spec: contractSize={contract}, minQty={min_qty}, qtyStep={step}, pp={pp}, qp={qp}")
+
+                    side = self.cfg.side.upper()
+                    mark = float(self.client.get_mark_price(self.cfg.symbol))
+
+                    # ---- 현재 포지션 파악(attach 모드 여부 선결정) ----
                     try:
-                        # pre_qty는 위에서 attach_mode 판단 직전에 스냅해 둔 값
-                        entry_filled_qty = max(float(self.state.position_qty or 0.0) - float(pre_qty or 0.0), 0.0)
-                        # 체결가: 평균가가 있으면 그 값, 없으면 마크가격 사용
-                        entry_price = float(self.state.position_avg_price or 0.0) or float(mark)
-                        if entry_filled_qty > 0:
-                            record_event(
-                                kind="ENTRY",
-                                symbol=self.cfg.symbol,
-                                price=entry_price,
-                                qty=entry_filled_qty,
-                                order_id=int(oid) if str(oid).isdigit() else None,
-                                client_order_id=None,
-                                ts_ms=self._ts_ms(),
-                            )
-                            self._log(f"📈 ENTRY 집계: price={entry_price}, qty={entry_filled_qty}")
-                    except Exception as _e:
-                        self._log(f"⚠️ ENTRY 집계 실패(무시): {_e}")
-                        
-                    # DCA 감지를 위한 초기 스냅(시장가 진입 후)
-                    try:
-                        self._prev_qty_snap = float(self.state.position_qty or 0.0)
+                        pre_avg, pre_qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
                     except Exception:
-                        self._prev_qty_snap = 0.0
+                        pre_avg, pre_qty = 0.0, 0.0
+                    min_live_qty = max(float(min_qty or 0.0), float(step or 0.0))
+                    attach_mode = (float(pre_qty) >= (min_live_qty * ZERO_EPS_FACTOR))
+                    self._attach_mode = attach_mode
 
-                    # ★ 기준가 확정: 우선 평단가 → 마크 → 라스트
-                    base_price = float(self.state.position_avg_price or 0.0)
-                    if base_price <= 0:
+                    # 0) 가용 USDT 체크 (attach 모드면 패스 가능)
+                    try:
+                        av = float(self.client.get_available_usdt())
+                        if av < 0.99:  # 1차 조회 결과가 0에 가까움
+                            self._log("⚠️ 가용 USDT 0 → 재측정 시도")
+                            time.sleep(1)
+                            av = float(self.client.get_available_usdt())
+                    except Exception as e:
+                        self._log(f"❌ 가용잔고 조회 실패: {e}")
+                        av = 0.0
+
+                    budget = sum(float(usdt) for _, usdt in self.cfg.dca_config)
+
+                    if av < 0.99 and not attach_mode:
+                        self._log("⛔ 가용 USDT 없음 → 종료")
+                        break
+
+                    # 1.6) === 사전 예산 점검 (attach 모드는 스킵) ===
+                    if not attach_mode:
+                        required, plan = self._estimate_required_margin(side, mark, spec, pp, step)
                         try:
-                            base_price = float(self.client.get_mark_price(self.cfg.symbol))
+                            av = float(self.client.get_available_usdt())
                         except Exception:
-                            base_price = float(self.client.get_last_price(self.cfg.symbol))
-                        self._log(f"⚠️ avg_price=0 → fallback base_price={base_price} (DCA initial only)")
+                            pass
+                        self.state.budget_ok = av + 1e-9 >= required
+                        self.state.budget_required = required
+                        self.state.budget_available = av
+                        if av + 1e-9 < required:
+                            gap = required - av
+                            self._log("⛔ 예산 부족: 모든 진입 주문에 필요한 증거금이 가용 USDT보다 큽니다.")
+                            self._log(f"   필요≈{required:.4f} USDT, 가용≈{av:.4f} USDT, 부족≈{gap:.4f} USDT")
+                            for idx, x in enumerate(plan, start=1):
+                                self._log(
+                                    f"   · {idx:02d} {x['type']}: price={x['price']} qty={x['qty']} → 증거금≈{x['usdt']:.4f} USDT"
+                                )
+                            break
+                        else:
+                            self._log(f" 예산 확인 OK: 필요≈{required:.4f} USDT ≤ 가용≈{av:.4f} USDT")
 
-                    # 3) 나머지 DCA 리밋 깔기
-                    entry_pos_side = "LONG" if side == "BUY" else "SHORT"
-                    cumulative = 0.0
-                    self.state.open_limit_ids.clear()
+                    # === 레버리지 검증 (자동조정 없음)
+                    lev_now = self.client.get_current_leverage(self.cfg.symbol, self.cfg.side)
+                    if lev_now is not None:
+                        want = float(self.cfg.leverage)
+                        diff = abs(lev_now - want) / max(want, 1.0)
+                        if diff > 0.02:
+                            self._log(f"⛔ 레버리지 불일치: 설정={want}x, 거래소={lev_now}x → 수량/증거금 오차 발생")
+                            self._log("   거래소 앱/웹에서 해당 심볼의 레버리지를 설정값과 동일하게 맞춘 뒤 다시 시작하세요.")
+                            break
+                    else:
+                        self._log("ℹ️ 현재 포지션이 없어 레버리지 조회값 없음 → 주문 후 다시 검증 예정")
 
-                    for i, (gap_pct, usdt_amt) in enumerate(self.cfg.dca_config[1:], start=2):
-                        cumulative += float(gap_pct)
-                        # ★ 롱은 기준가 아래, 숏은 기준가 위
-                        if side == "BUY":   # LONG
-                            price = base_price * (1 - cumulative / 100.0)
-                        else:               # SELL → SHORT
-                            price = base_price * (1 + cumulative / 100.0)
-                        price = float(f"{price:.{pp}f}") # 가격 정밀도 맞춤
-                        target_notional = float(usdt_amt) * float(self.cfg.leverage)
-                        raw_qty = target_notional / max(price * contract, 1e-12)
-                        q = floor_to_step(raw_qty, step)
-                        if q < (min_qty or step):
-                            self._log(f"⚠️ {i}차 수량이 최소수량 미달(raw={raw_qty}) → {max(min_qty, step)}로 보정")
-                            q = max(min_qty, step)
+                    # === attach 모드: 시장가/DCA 스킵, TP만 확보 ===
+                    if attach_mode:
+                        self._log(f" 기존 포지션 연결 모드: qty={pre_qty}, avg={pre_avg} → DCA/시장가 스킵, TP 확보")
+                        self.state.position_avg_price = pre_avg
+                        self.state.position_qty = pre_qty
                         try:
-                            lid = self.client.place_limit(
-                                self.cfg.symbol,
-                                side,
-                                q,
-                                price,
-                                position_side=entry_pos_side,
-                            )
+                            self._prev_qty_snap = float(self.state.position_qty or 0.0)
+                        except Exception:
+                            self._prev_qty_snap = 0.0
+                        last_entry = float(pre_avg or 0.0)
+                        last_tp_price = self._last_tp_price
+                        last_tp_qty = self._last_tp_qty
+                    else:
+                        entry_side = "BUY" if side == "BUY" else "SELL"
+                        entry_pos  = "LONG" if side == "BUY" else "SHORT"
+
+                        ok = self._cancel_tracked_limits(
+                            want_side=entry_side,
+                            want_pos=entry_pos,
+                            attempts=3,
+                            verify_sleep=0.4
+                        )
+                        if not ok:
+                            self._log("⚠️ 엔트리 전 오류로 인한 잔여 리밋 정리 실패 ⚠️")
+                            break
+
+                        # 2) 1차 시장가 진입
+                        self._cancel_tracked_limits()
+                        first_usdt = float(self.cfg.dca_config[0][1])
+                        target_notional = first_usdt * float(self.cfg.leverage)
+                        raw_qty = target_notional / max(mark * contract, 1e-12)
+                        qty = floor_to_step(raw_qty, step)
+                        if qty < (min_qty or step):
+                            self._log(f"⚠️ 1차 수량이 최소수량 미달(raw={raw_qty}) → {max(min_qty, step)}로 보정")
+                            qty = max(min_qty, step)
+                        try:
+                            oid = self.client.place_market(self.cfg.symbol, side, qty)
                         except Exception as e:
                             msg = str(e)
                             if "80001" in msg:
-                                # 잔액부족 → 남은 리밋은 더 깔지 않고 DCA 루프 종료
-                                self._log(f"⚠️ {i}차 리밋 주문 실패: {e}")
+                                self._log(f"❌ 시장가 진입 실패: {e}")
                                 break
                             elif "timed out" in msg.lower():
-                                # 타임아웃 → 남은 리밋은 생략하고 다음 사이클에서 다시 시도
-                                self._log(f"⚠️ {i}차 리밋 타임아웃: {e} → 남은 리밋 생략")
-                                break
+                                self._log(f"⚠️ 시장가 주문 타임아웃: {e} → attach 모드로 재시도")
+                                continue
                             else:
                                 raise
-                        self.state.open_limit_ids.append(str(lid))
-                        self._log(f" {i}차 리밋: id={lid}, price={price}, qty={q}, 투입≈{usdt_amt}USDT")
-
-                    # 4) 초기 TP 세팅
-                    self._refresh_position()
-                    tick = 10 ** (-pp) if pp > 0 else 0.01
-                    min_allowed = max(float(min_qty or 0.0), float(step or 0.0))
-                    qty_now = float(self.state.position_qty or 0.0)
-
-                    last_entry = None
-                    last_tp_price = None   # ← 이름은 price지만 stopPrice(트리거)를 저장
-                    last_tp_qty = None
-
-                    if qty_now >= min_allowed:
-                        entry = float(self.state.position_avg_price or 0.0)
-                        if entry <= 0:
-                            try:
-                                entry = float(self.client.get_mark_price(self.cfg.symbol))
-                            except Exception:
-                                entry = float(self.client.get_last_price(self.cfg.symbol))
-                            self._log(f"⚠️ avg_price=0 → fallback entry={entry} (initial only)")
-
-                        # 트리거(stopPrice) 계산
-                        tp_stop = tp_price_from_roi(entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-
-                        # 수량 스냅(미세 오차·최소단위 처리)
-                        tp_qty = _safe_close_qty(qty_now, float(step or 1.0), min_allowed)
-                        if tp_qty < min_allowed:
-                            tp_qty = min_allowed
-
-                        if tp_stop <= 0 or tp_qty <= 0:
-                            raise RuntimeError(f"TP invalid: stop={tp_stop}, qty={tp_qty}")
-
-                        tp_side = "SELL" if side == "BUY" else "BUY"
-                        tp_pos  = "LONG" if side == "BUY" else "SHORT"
-                        new_tp_id: str | None = None
+                        if not oid:
+                            raise RuntimeError("market order failed: no orderId")
+                        self._log(f" 1차 시장가 진입 주문: {oid} (투입≈{first_usdt} USDT, qty={qty})")
+                        time.sleep(1)
+                        self._refresh_position()
+                        try:
+                            entry_filled_qty = max(float(self.state.position_qty or 0.0) - float(pre_qty or 0.0), 0.0)
+                            entry_price = float(self.state.position_avg_price or 0.0) or float(mark)
+                            if entry_filled_qty > 0:
+                                record_event(
+                                    kind="ENTRY",
+                                    symbol=self.cfg.symbol,
+                                    price=entry_price,
+                                    qty=entry_filled_qty,
+                                    order_id=int(oid) if str(oid).isdigit() else None,
+                                    client_order_id=None,
+                                    ts_ms=self._ts_ms(),
+                                )
+                                self._log(f"📈 ENTRY 집계: price={entry_price}, qty={entry_filled_qty}")
+                        except Exception as _e:
+                            self._log(f"⚠️ ENTRY 집계 실패(무시): {_e}")
 
                         try:
-                            # ✅ 조건부 시장가 TP로 발주 (발동 시 MARKET 청산)
-                            new_tp_id = self.client.place_tp_market(
-                                self.cfg.symbol,
-                                side=tp_side,
-                                stop_price=tp_stop,      # ← price 대신 stopPrice만!
-                                qty=tp_qty,
-                                position_side=tp_pos,    # HEDGE 모드 필수
-                            )
-                        except Exception as e:
-                            if "80001" in str(e):
-                                self._log(f"⚠️ 초기 TP 주문 실패: {e}")  # 실패는 무시하고 진행
-                                new_tp_id = None
-                            else:
-                                raise
+                            self._prev_qty_snap = float(self.state.position_qty or 0.0)
+                        except Exception:
+                            self._prev_qty_snap = 0.0
 
-                        if new_tp_id:
-                            self.state.tp_order_id = str(new_tp_id)
-                            last_entry = entry
-                            last_tp_price = tp_stop     # ← stopPrice 기록
-                            last_tp_qty = tp_qty
-                            self._last_tp_price = tp_stop
-                            self._last_tp_qty = tp_qty
-                            self._log(f"✅ TP(MKT) 배치 완료: id={new_tp_id}, stop={tp_stop}, qty={tp_qty}, side={tp_side}/{tp_pos}")
-                        else:
-                            self._log("ℹ️ 초기 TP 주문 생략")
-                            last_entry = entry
-                            last_tp_price = tp_stop
-                            last_tp_qty = tp_qty
-                    else:
-                        self._log("ℹ️ 포지션 없음 또는 최소단위 미만 → TP 생략")
+                        base_price = float(self.state.position_avg_price or 0.0)
+                        if base_price <= 0:
+                            try:
+                                base_price = float(self.client.get_mark_price(self.cfg.symbol))
+                            except Exception:
+                                base_price = float(self.client.get_last_price(self.cfg.symbol))
+                            self._log(f"⚠️ avg_price=0 → fallback base_price={base_price} (DCA initial only)")
+
+                        entry_pos_side = "LONG" if side == "BUY" else "SHORT"
+                        cumulative = 0.0
+                        self.state.open_limit_ids.clear()
+
+                        for i, (gap_pct, usdt_amt) in enumerate(self.cfg.dca_config[1:], start=2):
+                            cumulative += float(gap_pct)
+                            if side == "BUY":
+                                price = base_price * (1 - cumulative / 100.0)
+                            else:
+                                price = base_price * (1 + cumulative / 100.0)
+                            price = float(f"{price:.{pp}f}")
+                            target_notional = float(usdt_amt) * float(self.cfg.leverage)
+                            raw_qty = target_notional / max(price * contract, 1e-12)
+                            q = floor_to_step(raw_qty, step)
+                            if q < (min_qty or step):
+                                self._log(f"⚠️ {i}차 수량이 최소수량 미달(raw={raw_qty}) → {max(min_qty, step)}로 보정")
+                                q = max(min_qty, step)
+                            try:
+                                lid = self.client.place_limit(
+                                    self.cfg.symbol,
+                                    side,
+                                    q,
+                                    price,
+                                    position_side=entry_pos_side,
+                                )
+                            except Exception as e:
+                                msg = str(e)
+                                if "80001" in msg:
+                                    self._log(f"⚠️ {i}차 리밋 주문 실패: {e}")
+                                    break
+                                elif "timed out" in msg.lower():
+                                    self._log(f"⚠️ {i}차 리밋 타임아웃: {e} → 남은 리밋 생략")
+                                    break
+                                else:
+                                    raise
+                            self.state.open_limit_ids.append(str(lid))
+                            self._log(f" {i}차 리밋: id={lid}, price={price}, qty={q}, 투입≈{usdt_amt}USDT")
+
+                        # 4) 초기 TP 세팅
+                        self._refresh_position()
+                        tick = 10 ** (-pp) if pp > 0 else 0.01
+                        min_allowed = max(float(min_qty or 0.0), float(step or 0.0))
+                        qty_now = float(self.state.position_qty or 0.0)
+
                         last_entry = None
                         last_tp_price = None
                         last_tp_qty = None
 
-                # ===== 5) 모니터링 루프 =====
-                tp_reset_cooldown = 3.0
-                last_tp_reset_ts = 0.0
-                zero_streak = 0  # 종료 판정 연속 횟수
-                did_cleanup = False  # 이번 사이클에서 오더/TP 정리를 했는지 표시
+                        if qty_now >= min_allowed:
+                            entry = float(self.state.position_avg_price or 0.0)
+                            if entry <= 0:
+                                try:
+                                    entry = float(self.client.get_mark_price(self.cfg.symbol))
+                                except Exception:
+                                    entry = float(self.client.get_last_price(self.cfg.symbol))
+                                self._log(f"⚠️ avg_price=0 → fallback entry={entry} (initial only)")
 
-                while not self._stop:
-                    time.sleep(POLL_SEC)
-                    self._refresh_position()
+                            tp_stop = tp_price_from_roi(entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
+                            tp_qty = _safe_close_qty(qty_now, float(step or 1.0), min_allowed)
+                            if tp_qty < min_allowed:
+                                tp_qty = min_allowed
+                            if tp_stop <= 0 or tp_qty <= 0:
+                                raise RuntimeError(f"TP invalid: stop={tp_stop}, qty={tp_qty}")
 
-                    # ── DCA 체결 감지: 이전 대비 포지션 수량이 의미 있게 증가하면 DCA로 간주
-                    # 기준: 최소단위(step/minQty)의 ZERO_EPS_FACTOR 만큼 증가
-                    if not hasattr(self, "_prev_qty_snap"):
-                        self._prev_qty_snap = float(self.state.position_qty or 0.0)
-                    prev_qty_snap = float(self._prev_qty_snap or 0.0)
+                            tp_side = "SELL" if side == "BUY" else "BUY"
+                            tp_pos  = "LONG" if side == "BUY" else "SHORT"
+                            new_tp_id: str | None = None
 
-                    qty_now_for_dca = float(self.state.position_qty or 0.0)
-                    min_allowed = max(float(min_qty or 0.0), float(step or 0.0))
-                    zero_eps = min_allowed * ZERO_EPS_FACTOR
-                    inc = qty_now_for_dca - prev_qty_snap
-
-                    # ⬅ 마지막 비제로 수량을 추적(닫히기 직전 수량 보존용)
-                    if qty_now_for_dca > 0:
-                        self._last_nonzero_qty = qty_now_for_dca
-
-                    # 오픈된 리밋 주문이 있을 때의 증가만 DCA로 집계 (가짜 신호 방지)
-                    has_tracked_limits = bool(self.state.open_limit_ids)
-                    if has_tracked_limits and inc > zero_eps:
-                        try:
-                            # 체결가 대용: 현재 마크가격(또는 평균가)
-                            dca_price = float(self.state.position_avg_price or 0.0) or float(mark)
-                            dca_qty = inc
-                            record_event(
-                                kind="DCA",
-                                symbol=self.cfg.symbol,
-                                price=dca_price,
-                                qty=dca_qty,
-                                order_id=None,
-                                client_order_id=None,
-                                ts_ms=self._ts_ms(),
-                            )
-                            self._log(f"📈 DCA 집계: price={dca_price}, qty={dca_qty}")
-                        except Exception as _e:
-                            self._log(f"⚠️ DCA 집계 실패(무시): {_e}")
-
-                    # 스냅샷 갱신
-                    self._prev_qty_snap = qty_now_for_dca
-
-                    # 항상 루프 초반에 현재 평단/수량을 먼저 스냅샷
-                    entry_now = float(self.state.position_avg_price or 0.0)
-                    qty_now   = float(self.state.position_qty or 0.0)
-
-                    # 오픈오더 조회 (한 번만)
-                    try:
-                        open_orders = self.client.open_orders(self.cfg.symbol)
-                    except Exception as e:
-                        self._log(f"⚠️ 오픈오더 조회 실패: {e}")
-                        open_orders = []
-
-                    # TP 생존 확인 (tracked id 기준)
-                    tp_alive = False
-                    if self.state.tp_order_id:
-                        want = str(self.state.tp_order_id)
-                        for o in open_orders:
-                            oid = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
-                            if oid == want:
-                                tp_alive = True
-                                break
-
-                    # ----- 종료 판정 (연속 N회 + TP 미생존 + 이중확인) -----
-                    tick = 10 ** (-pp) if pp > 0 else 0.01
-                    min_allowed = max(float(min_qty or 0.0), float(step or 0.0))  # 수량 기준만
-                    zero_eps = min_allowed * ZERO_EPS_FACTOR
-                    if qty_now < zero_eps:
-                        zero_streak += 1
-                    else:
-                        zero_streak = 0
-                    really_closed = (zero_streak >= CLOSE_ZERO_STREAK) and (not tp_alive)
-
-                    if really_closed:
-                        try:
-                            chk_avg, chk_qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
-                        except Exception:
-                            chk_avg, chk_qty = 0.0, 0.0
-
-                        if float(chk_qty or 0.0) < zero_eps:
-                            # === TP 이벤트 집계 (정리 전에 기록) ===
                             try:
-                                # 우선순위: 마지막 비제로 수량 > 직전 스냅 > 현재 수량
-                                if hasattr(self, "_last_nonzero_qty") and float(self._last_nonzero_qty) > 0:
-                                    closed_qty = float(self._last_nonzero_qty)
-                                elif hasattr(self, "_prev_qty_snap") and float(self._prev_qty_snap) > 0:
-                                    closed_qty = float(self._prev_qty_snap)
-                                else:
-                                    closed_qty = float(qty_now)
-
-                                # 트리거(stop) 없으면 마크가격
-                                tp_price = float(self._last_tp_price or 0.0) or float(mark)
-
-                                # 진입가 추정: entry_now(>0) 없으면 last_entry → 그마저 없으면 평균가/마크
-                                eff_entry = float(entry_now or 0.0) if (entry_now and entry_now > 0) else float(last_entry or 0.0)
-                                if eff_entry <= 0:
-                                    eff_entry = float(self.state.position_avg_price or 0.0) or float(mark)
-
-                                side_dir = self.cfg.side.upper()
-                                contract_size = float(contract or 1.0)
-                                if side_dir == "BUY":   # LONG
-                                    pnl = (tp_price - eff_entry) * closed_qty * contract_size
-                                else:                   # SELL (SHORT)
-                                    pnl = (eff_entry - tp_price) * closed_qty * contract_size
-
-                                if abs(pnl) < 1e-10:
-                                    pnl = 0.0
-
-                                record_event(
-                                    kind="TP",
-                                    symbol=self.cfg.symbol,
-                                    price=tp_price,
-                                    qty=closed_qty,
-                                    ts_ms=self._ts_ms(),
-                                    pnl=pnl,
-                                    side=side_dir,
-                                    entry_price=eff_entry
+                                new_tp_id = self.client.place_tp_market(
+                                    self.cfg.symbol,
+                                    side=tp_side,
+                                    stop_price=tp_stop,
+                                    qty=tp_qty,
+                                    position_side=tp_pos,
                                 )
-                                self._log(f"📈 TP 집계: price={tp_price}, qty={closed_qty}, pnl={pnl:.6f}")
+                            except Exception as e:
+                                if "80001" in str(e):
+                                    self._log(f"⚠️ 초기 TP 주문 실패: {e}")
+                                    new_tp_id = None
+                                else:
+                                    raise
 
-                                # 청산 후 비제로 스냅 정리
-                                self._last_nonzero_qty = 0.0
+                            if new_tp_id:
+                                self.state.tp_order_id = str(new_tp_id)
+                                last_entry = entry
+                                last_tp_price = tp_stop
+                                last_tp_qty = tp_qty
+                                self._last_tp_price = tp_stop
+                                self._last_tp_qty = tp_qty
+                                self._log(f"✅ TP(MKT) 배치 완료: id={new_tp_id}, stop={tp_stop}, qty={tp_qty}, side={tp_side}/{tp_pos}")
+                            else:
+                                self._log("ℹ️ 초기 TP 주문 생략")
+                                last_entry = entry
+                                last_tp_price = tp_stop
+                                last_tp_qty = tp_qty
+                        else:
+                            self._log("ℹ️ 포지션 없음 또는 최소단위 미만 → TP 생략")
+                            last_entry = None
+                            last_tp_price = None
+                            last_tp_qty = None
+
+                    # ===== 5) 모니터링 루프 =====
+                    tp_reset_cooldown = 3.0
+                    last_tp_reset_ts = 0.0
+                    zero_streak = 0
+                    did_cleanup = False
+
+                    while not self._stop:
+                        time.sleep(POLL_SEC)
+                        self._refresh_position()
+
+                        if not hasattr(self, "_prev_qty_snap"):
+                            self._prev_qty_snap = float(self.state.position_qty or 0.0)
+                        prev_qty_snap = float(self._prev_qty_snap or 0.0)
+
+                        qty_now_for_dca = float(self.state.position_qty or 0.0)
+                        min_allowed = max(float(min_qty or 0.0), float(step or 0.0))
+                        zero_eps = min_allowed * ZERO_EPS_FACTOR
+                        inc = qty_now_for_dca - prev_qty_snap
+
+                        if qty_now_for_dca > 0:
+                            self._last_nonzero_qty = qty_now_for_dca
+
+                        has_tracked_limits = bool(self.state.open_limit_ids)
+                        if has_tracked_limits and inc > zero_eps:
+                            try:
+                                dca_price = float(self.state.position_avg_price or 0.0) or float(mark)
+                                dca_qty = inc
+                                record_event(
+                                    kind="DCA",
+                                    symbol=self.cfg.symbol,
+                                    price=dca_price,
+                                    qty=dca_qty,
+                                    order_id=None,
+                                    client_order_id=None,
+                                    ts_ms=self._ts_ms(),
+                                )
+                                self._log(f"📈 DCA 집계: price={dca_price}, qty={dca_qty}")
                             except Exception as _e:
-                                self._log(f"⚠️ TP 집계 실패(무시): {_e}")
+                                self._log(f"⚠️ DCA 집계 실패(무시): {_e}")
 
-                            # ✅ 포지션 완전 청산 → DCA/TP 전부 정리 (이번 사이클 최초 1회만)
-                            if not did_cleanup:
-                                self._cancel_tracked_limits()
-                                if self.state.tp_order_id:
-                                    try:
-                                        self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
-                                    except Exception:
-                                        pass
-                                    self.state.tp_order_id = None
-                                self.state.reset_orders()
-                                did_cleanup = True
+                        self._prev_qty_snap = qty_now_for_dca
 
-                            self._log("✅ 포지션 종료 확정(연속검증+이중확인) → 대기")
-                            break
+                        entry_now = float(self.state.position_avg_price or 0.0)
+                        qty_now   = float(self.state.position_qty or 0.0)
+
+                        try:
+                            open_orders = self.client.open_orders(self.cfg.symbol)
+                        except Exception as e:
+                            self._log(f"⚠️ 오픈오더 조회 실패: {e}")
+                            open_orders = []
+
+                        tp_alive = False
+                        if self.state.tp_order_id:
+                            want = str(self.state.tp_order_id)
+                            for o in open_orders:
+                                oid = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
+                                if oid == want:
+                                    tp_alive = True
+                                    break
+
+                        tick = 10 ** (-pp) if pp > 0 else 0.01
+                        min_allowed = max(float(min_qty or 0.0), float(step or 0.0))
+                        zero_eps = min_allowed * ZERO_EPS_FACTOR
+                        if qty_now < zero_eps:
+                            zero_streak += 1
                         else:
                             zero_streak = 0
+                        really_closed = (zero_streak >= CLOSE_ZERO_STREAK) and (not tp_alive)
 
-                    # ===== TP 생존/동일 수량 검사 (ID와 무관하게 탐지)
-                    want_side = "SELL" if side == "BUY" else "BUY"
-                    want_pos  = "LONG" if side == "BUY" else "SHORT"
-                    tp_equal_exists = False
-                    tp_equal_id = None
-                    tp_equal_price = None
-                    for o in open_orders:
-                        o_side = str(o.get("side") or o.get("orderSide") or "").upper()
-                        o_pos  = str(o.get("positionSide") or o.get("posSide") or o.get("position_side") or "").upper()
-                        if (o_side != want_side) or (o_pos != want_pos):
-                            continue
-                        q = o.get("origQty") or o.get("quantity") or o.get("qty") or o.get("orig_quantity")
-                        try:
-                            oq = float(q) if q is not None else 0.0
-                        except Exception:
-                            oq = 0.0
-                        if abs(qty_now - oq) < float(step or 1.0):
-                            tp_equal_exists = True
-                            tp_equal_id = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
-                            p = o.get("price") or o.get("origPrice") or o.get("limitPrice")
+                        if really_closed:
                             try:
-                                tp_equal_price = float(p) if p is not None else None
+                                chk_avg, chk_qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
                             except Exception:
-                                tp_equal_price = None
-                            break
+                                chk_avg, chk_qty = 0.0, 0.0
 
-                    # 동일 수량 TP가 이미 있으면 → 감시 모드로 스킵 (재발주 금지)
-                    if tp_equal_exists:
-                        if not tp_alive:
-                            # 트래킹되지 않은 TP라면 채택
-                            self.state.tp_order_id = tp_equal_id
-                            if tp_equal_price is not None:
-                                self._last_tp_price = tp_equal_price
-                            self._last_tp_qty = qty_now
-                            self._log(f"ℹ️ 기존 TP 채택: id={tp_equal_id}, qty≈{qty_now}")
-                        continue
+                            if float(chk_qty or 0.0) < zero_eps:
+                                try:
+                                    if hasattr(self, "_last_nonzero_qty") and float(self._last_nonzero_qty) > 0:
+                                        closed_qty = float(self._last_nonzero_qty)
+                                    elif hasattr(self, "_prev_qty_snap") and float(self._prev_qty_snap) > 0:
+                                        closed_qty = float(self._prev_qty_snap)
+                                    else:
+                                        closed_qty = float(qty_now)
 
-                    # ----- TP 재설정(데드밴드 + 쿨다운) -----
-                    need_reset_tp = False
-                    # 평단 대체는 entry_now를 덮어쓰지 말고 별도 변수로
-                    eff_entry = entry_now if entry_now > 0 else float(last_entry or 0.0)
-                    if not tp_alive:
-                        need_reset_tp = (qty_now >= min_allowed and eff_entry > 0)
-                    else:
-                        if qty_now >= min_allowed and eff_entry > 0:
-                            # 지정가 가격이 아니라 TP 트리거(stopPrice)를 이상값으로 계산
-                            ideal_stop = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-                            ideal_qty  = _safe_close_qty(qty_now, step, min_allowed)
-                            if (last_entry is None) or (last_tp_price is None) or (last_tp_qty is None):
-                                need_reset_tp = True
-                            elif (abs(eff_entry - last_entry) >= 2 * tick) or \
-                                (abs(ideal_stop - last_tp_price) >= 2 * tick) or \
-                                (abs(ideal_qty - last_tp_qty) >= float(step or 1.0)):
-                                need_reset_tp = True
+                                    tp_price = float(self._last_tp_price or 0.0) or float(mark)
 
-                    if need_reset_tp:
-                        now_ts = self._now()
-                        if now_ts - last_tp_reset_ts < tp_reset_cooldown:
-                            continue
-                        if self.state.tp_order_id and tp_alive:
-                            try:
-                                self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
-                                self._wait_cancel(self.state.tp_order_id, timeout=2.5)
-                            except Exception as e:
-                                self._log(f"⚠️ TP 취소 실패(무시): {e}")
-                        if eff_entry <= 0 or qty_now < min_allowed:
-                            continue
+                                    eff_entry = float(entry_now or 0.0) if (entry_now and entry_now > 0) else float(last_entry or 0.0)
+                                    if eff_entry <= 0:
+                                        eff_entry = float(self.state.position_avg_price or 0.0) or float(mark)
 
-                        # 트리거(stopPrice)와 수량 계산
-                        new_stop = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-                        new_qty  = _safe_close_qty(qty_now, step, min_allowed)
-                        self._refresh_position()
-                        qty_last = float(self.state.position_qty or 0.0)
-                        if qty_last < min_allowed:
-                            self._log("ⓘ TP skip: position vanished just before placement (qty=0)")
-                            continue
-                        new_qty  = _safe_close_qty(qty_last, step, min_allowed)
-                        
-                        new_side = "SELL" if side == "BUY" else "BUY"
-                        new_pos  = "LONG" if side == "BUY" else "SHORT"
+                                    side_dir = self.cfg.side.upper()
+                                    contract_size = float(contract or 1.0)
+                                    if side_dir == "BUY":
+                                        pnl = (tp_price - eff_entry) * closed_qty * contract_size
+                                    else:
+                                        pnl = (eff_entry - tp_price) * closed_qty * contract_size
+                                    if abs(pnl) < 1e-10:
+                                        pnl = 0.0
 
-                        try:
-                            # ✅ LIMIT 대신 조건부 시장가 TP 사용
-                            new_id = self.client.place_tp_market(
-                                self.cfg.symbol,
-                                side=new_side,            # 청산 방향
-                                stop_price=new_stop,      # 트리거 가격(= stopPrice)
-                                qty=new_qty,              # 일부/전량
-                                position_side=new_pos,    # HEDGE 모드일 때 필수
-                            )
-                        except Exception as e:
-                            msg = str(e)
-                            if ("80001" in msg) or ("timed out" in msg.lower()):
-                                continue
-                            else:
-                                raise
+                                    record_event(
+                                        kind="TP",
+                                        symbol=self.cfg.symbol,
+                                        price=tp_price,
+                                        qty=closed_qty,
+                                        ts_ms=self._ts_ms(),
+                                        pnl=pnl,
+                                        side=side_dir,
+                                        entry_price=eff_entry
+                                    )
+                                    self._log(f"📈 TP 집계: price={tp_price}, qty={closed_qty}, pnl={pnl:.6f}")
+                                    self._last_nonzero_qty = 0.0
+                                except Exception as _e:
+                                    self._log(f"⚠️ TP 집계 실패(무시): {_e}")
 
-                        self.state.tp_order_id = str(new_id)
-                        last_entry     = eff_entry
-                        last_tp_price  = new_stop   # ← 이름은 price지만 "트리거(stop)"를 저장
-                        last_tp_qty    = new_qty
-                        self._last_tp_price = new_stop
-                        self._last_tp_qty   = new_qty
-                        last_tp_reset_ts = now_ts
-                        self._log(f"♻️ TP 재설정(MKT): id={new_id}, stop={new_stop}, qty={new_qty}")
+                                if not did_cleanup:
+                                    self._cancel_tracked_limits()
+                                    if self.state.tp_order_id:
+                                        try:
+                                            self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
+                                        except Exception:
+                                            pass
+                                        self.state.tp_order_id = None
+                                    self.state.reset_orders()
+                                    did_cleanup = True
 
-                # 루프 탈출: repeat면 다시 반복
-                if self._stop:
-                    pass
-                elif not self.state.repeat_mode:
-                    pass
-                else:
-                    # 반복 진입 전 정리: 위에서 이미 정리했다면 스킵
-                    if not did_cleanup:
-                        self._cancel_tracked_limits()
-                        if self.state.tp_order_id:
-                            try:
-                                self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
-                            except Exception:
-                                pass
-                            self.state.tp_order_id = None
-                        self.state.reset_orders()
-                        did_cleanup = True
-                    delay = max(0, RESTART_DELAY_SEC)
-                    if delay > 0:
-                        self._log(f" 반복 모드 → {delay}초 대기 후 재시작")
-                        for _ in range(delay):
-                            if self._stop:
+                                self._log("✅ 포지션 종료 확정(연속검증+이중확인) → 대기")
                                 break
-                            time.sleep(1)
-                    if not self._stop:
-                        self._log(" 재시작")
-                        # while 루프로 재진입은 상위 _run() 흐름 유지
+                            else:
+                                zero_streak = 0
 
-        except Exception as e:
-            # 예외 발생 시 봇을 멈추지 말고 짧게 대기 후 상위 루프 재시작
-            try:
-                self._log(f"⚠️ 런타임 오류(자동복구 대기): {e}")
-            except Exception:
-                pass
-            time.sleep(300) # 5분 대기
-            return self._run()   # 다시 실행 (재귀적으로 복구)
+                        want_side = "SELL" if side == "BUY" else "BUY"
+                        want_pos  = "LONG" if side == "BUY" else "SHORT"
+                        tp_equal_exists = False
+                        tp_equal_id = None
+                        tp_equal_price = None
+                        for o in open_orders:
+                            o_side = str(o.get("side") or o.get("orderSide") or "").upper()
+                            o_pos  = str(o.get("positionSide") or o.get("posSide") or o.get("position_side") or "").upper()
+                            if (o_side != want_side) or (o_pos != want_pos):
+                                continue
+                            q = o.get("origQty") or o.get("quantity") or o.get("qty") or o.get("orig_quantity")
+                            try:
+                                oq = float(q) if q is not None else 0.0
+                            except Exception:
+                                oq = 0.0
+                            if abs(qty_now - oq) < float(step or 1.0):
+                                tp_equal_exists = True
+                                tp_equal_id = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
+                                p = o.get("price") or o.get("origPrice") or o.get("limitPrice")
+                                try:
+                                    tp_equal_price = float(p) if p is not None else None
+                                except Exception:
+                                    tp_equal_price = None
+                                break
+
+                        if tp_equal_exists:
+                            if not tp_alive:
+                                self.state.tp_order_id = tp_equal_id
+                                if tp_equal_price is not None:
+                                    self._last_tp_price = tp_equal_price
+                                self._last_tp_qty = qty_now
+                                self._log(f"ℹ️ 기존 TP 채택: id={tp_equal_id}, qty≈{qty_now}")
+                            continue
+
+                        need_reset_tp = False
+                        eff_entry = entry_now if entry_now > 0 else float(last_entry or 0.0)
+                        if not tp_alive:
+                            need_reset_tp = (qty_now >= min_allowed and eff_entry > 0)
+                        else:
+                            if qty_now >= min_allowed and eff_entry > 0:
+                                ideal_stop = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
+                                ideal_qty  = _safe_close_qty(qty_now, step, min_allowed)
+                                if (last_entry is None) or (last_tp_price is None) or (last_tp_qty is None):
+                                    need_reset_tp = True
+                                elif (abs(eff_entry - last_entry) >= 2 * tick) or \
+                                    (abs(ideal_stop - last_tp_price) >= 2 * tick) or \
+                                    (abs(ideal_qty - last_tp_qty) >= float(step or 1.0)):
+                                    need_reset_tp = True
+
+                        if need_reset_tp:
+                            now_ts = self._now()
+                            if now_ts - last_tp_reset_ts < tp_reset_cooldown:
+                                continue
+                            if self.state.tp_order_id and tp_alive:
+                                try:
+                                    self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
+                                    self._wait_cancel(self.state.tp_order_id, timeout=2.5)
+                                except Exception as e:
+                                    self._log(f"⚠️ TP 취소 실패(무시): {e}")
+                            if eff_entry <= 0 or qty_now < min_allowed:
+                                continue
+
+                            new_stop = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
+                            new_qty  = _safe_close_qty(qty_now, step, min_allowed)
+                            self._refresh_position()
+                            qty_last = float(self.state.position_qty or 0.0)
+                            if qty_last < min_allowed:
+                                self._log("ⓘ TP skip: position vanished just before placement (qty=0)")
+                                continue
+                            new_qty  = _safe_close_qty(qty_last, step, min_allowed)
+                            new_side = "SELL" if side == "BUY" else "BUY"
+                            new_pos  = "LONG" if side == "BUY" else "SHORT"
+
+                            try:
+                                new_id = self.client.place_tp_market(
+                                    self.cfg.symbol,
+                                    side=new_side,
+                                    stop_price=new_stop,
+                                    qty=new_qty,
+                                    position_side=new_pos,
+                                )
+                            except Exception as e:
+                                msg = str(e)
+                                if ("80001" in msg) or ("timed out" in msg.lower()):
+                                    continue
+                                else:
+                                    raise
+
+                            self.state.tp_order_id = str(new_id)
+                            last_entry     = eff_entry
+                            last_tp_price  = new_stop
+                            last_tp_qty    = new_qty
+                            self._last_tp_price = new_stop
+                            self._last_tp_qty   = new_qty
+                            last_tp_reset_ts = now_ts
+                            self._log(f"♻️ TP 재설정(MKT): id={new_id}, stop={new_stop}, qty={new_qty}")
+
+                    # 루프 탈출: repeat면 다시 반복
+                    if self._stop:
+                        pass
+                    elif not self.state.repeat_mode:
+                        pass
+                    else:
+                        if not did_cleanup:
+                            self._cancel_tracked_limits()
+                            if self.state.tp_order_id:
+                                try:
+                                    self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
+                                except Exception:
+                                    pass
+                                self.state.tp_order_id = None
+                            self.state.reset_orders()
+                            did_cleanup = True
+                        delay = max(0, RESTART_DELAY_SEC)
+                        if delay > 0:
+                            self._log(f" 반복 모드 → {delay}초 대기 후 재시작")
+                            for _ in range(delay):
+                                if self._stop:
+                                    break
+                                time.sleep(1)
+                        if not self._stop:
+                            self._log(" 재시작")
+
+                except Exception as e:
+                    # 🔁 여기서만 자기치유. 재귀 호출 금지.
+                    try:
+                        self._log(f"⚠️ 런타임 오류(자동복구 유지): {e}")
+                    except Exception:
+                        pass
+                    if self._stop:
+                        break
+                    time.sleep(300)
+                    continue
         finally:
             self.state.running = False
             self._log("⏹️ 봇 종료")
