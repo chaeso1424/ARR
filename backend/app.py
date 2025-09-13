@@ -5,7 +5,7 @@ import re
 import jwt
 import datetime as dt
 import threading
-import time
+import time as _time, time
 from dotenv import load_dotenv
 from pathlib import Path
 from collections import deque
@@ -14,12 +14,16 @@ from flask import Flask, request, jsonify, Response, stream_with_context, g
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from time import perf_counter
-import time as _time
 
 _EXEC = ThreadPoolExecutor(max_workers=4)
+
+# 주별 일별 시리즈
 LAST_WEEKLY = {"series": [], "ts": 0.0}
 LAST_DAILY  = {"series": [], "ts": 0.0}
 
+# 상태 캐시(봇 status용)
+STATUS_CACHE = {}  # { bot_id: {"ts": float, "data": dict} }
+STATUS_TTL = 2.0   # 초
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 0) 환경 로드
@@ -248,6 +252,27 @@ def _tail_log_lines(path: Path, tail: int, grep: str | None = None, level: str |
 # 7) 주별 잔고 시리즈
 # ───────────────────────────────────────────────────────────────────────────────
 
+LAST_DAILY  = {"series": [], "ts": 0.0}
+LAST_WEEKLY = {"series": [], "ts": 0.0}
+MAX_AGE_S   = 60  # 신선 기준(초). 필요에 맞게 조절.
+
+def _refresh_daily(days):
+    try:
+        res = get_daily_series(days)
+        LAST_DAILY["series"] = res or []
+        LAST_DAILY["ts"] = _time.time()
+    except Exception as e:
+        print("[daily refresh] error:", e)
+
+def _refresh_weekly(weeks):
+    try:
+        res = get_weekly_series(weeks)
+        LAST_WEEKLY["series"] = res or []
+        LAST_WEEKLY["ts"] = _time.time()
+    except Exception as e:
+        print("[weekly refresh] error:", e)
+
+
 def _seconds_until_next_utc_midnight():
     now = datetime.now(timezone.utc)
     tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -280,19 +305,21 @@ start_snapshot_daemon_once()
 @app.get("/api/balance/series")
 def api_balance_series():
     gran = (request.args.get("granularity") or "w").lower()
+    now  = _time.time()
     if gran == "d":
-        try:
-            days = max(1, int(request.args.get("days", "30")))
-        except:
-            days = 30
-        series, stale = _nonblocking_call(get_daily_series, days, timeout=0.8, cache=LAST_DAILY)
+        days = int(request.args.get("days", "30") or 30)
+        series = LAST_DAILY["series"] or []
+        stale  = (now - LAST_DAILY["ts"] > MAX_AGE_S)
+        # 캐시가 비었거나 오래됐으면 백그라운드로 갱신만 트리거(대기 X)
+        if stale:
+            _EXEC.submit(_refresh_daily, days)
         return jsonify({"granularity": "d", "series": series, "stale": stale})
     else:
-        try:
-            weeks = max(1, int(request.args.get("weeks", "12")))
-        except:
-            weeks = 12
-        series, stale = _nonblocking_call(get_weekly_series, weeks, timeout=0.8, cache=LAST_WEEKLY)
+        weeks = int(request.args.get("weeks", "12") or 12)
+        series = LAST_WEEKLY["series"] or []
+        stale  = (now - LAST_WEEKLY["ts"] > MAX_AGE_S)
+        if stale:
+            _EXEC.submit(_refresh_weekly, weeks)
         return jsonify({"granularity": "w", "series": series, "stale": stale})
     
 def _nonblocking_call(func, *args, timeout=0.8, cache=None):
@@ -571,15 +598,66 @@ def logs_text():
 # ───────────────────────────────────────────────────────────────────────────────
 # 8) 다중 봇 API
 # ───────────────────────────────────────────────────────────────────────────────
+def _apply_exchange_settings_async(cfg):
+    try:
+        client.set_margin_mode(cfg.symbol, cfg.margin_mode)
+        client.set_leverage(cfg.symbol, cfg.leverage)
+    except Exception as e:
+        log(f"⚠️ config 적용 실패({getattr(cfg,'symbol',None)}): {e}")
+
+def _get_status_live(cfg, state, timeout_each=0.7):
+    # 병렬 제출
+    fut_ppqp = _EXEC.submit(lambda: client.get_symbol_filters(cfg.symbol))
+    fut_mark = _EXEC.submit(lambda: float(client.get_mark_price(cfg.symbol)))
+    fut_pos  = _EXEC.submit(lambda: client.position_info(cfg.symbol, cfg.side))
+    fut_lev  = _EXEC.submit(lambda: client.get_current_leverage(cfg.symbol, cfg.side))
+
+    # 개별 타임아웃 수집(타임아웃/에러는 None)
+    def _get(f):
+        try: return f.result(timeout=timeout_each)
+        except: return None
+
+    ppqp = _get(fut_ppqp) or (4, 0)
+    try:
+        pp, qp = int(ppqp[0]), int(ppqp[1])
+    except:
+        pp, qp = 4, 0
+
+    mark = _get(fut_mark)
+    if mark is not None:
+        try: mark = float(mark)
+        except: mark = None
+
+    pos = _get(fut_pos) or (0.0, 0.0)
+    try:
+        avg, qty = float(pos[0] or 0.0), float(pos[1] or 0.0)
+    except:
+        avg, qty = 0.0, 0.0
+
+    exch_lev = _get(fut_lev)
+
+    return {
+        "running": state.running,
+        "repeat_mode": getattr(state, "repeat_mode", False),
+        "tp_order_id": getattr(state, "tp_order_id", None),
+        "symbol": cfg.symbol,
+        "side": cfg.side,
+        "price_precision": pp,
+        "position_avg_price": avg,
+        "position_qty": qty,
+        "mark_price": mark,
+        "exchange_leverage": exch_lev,
+        "cfg_leverage": cfg.leverage,
+        "dca_config": cfg.dca_config,
+    }
+
 @app.get("/api/bots")
 def list_bots():
     out = []
     for f in BOTS_DIR.glob("*.json"):
         bot_id = f.stem
         cfg_data = read_bot_config(bot_id) or default_config(bot_id)
-        running = False
-        if bot_id in BOTS:
-            running = BOTS[bot_id]["state"].running
+        running = bool(bot_id in BOTS and BOTS[bot_id]["state"].running)
         out.append({
             "id": bot_id,
             "name": cfg_data.get("name", bot_id),
@@ -590,12 +668,15 @@ def list_bots():
             "status": "running" if running else "stopped",
             "running": running
         })
+
+    # 파일이 하나도 없으면 "파일만" 생성하고 리턴 (Runner 생성 X)
     if not out:
-        write_bot_config(DEFAULT_BOT_ID, default_config(DEFAULT_BOT_ID))
-        get_or_create_bot(DEFAULT_BOT_ID)
+        cfg = default_config(DEFAULT_BOT_ID)
+        write_bot_config(DEFAULT_BOT_ID, cfg)
         out = [{
-            "id": DEFAULT_BOT_ID, "name": DEFAULT_BOT_ID, "symbol": "ETH-USDT", "side": "BUY",
-            "margin_mode": "CROSS", "leverage": 10, "status": "stopped", "running": False
+            "id": DEFAULT_BOT_ID, "name": DEFAULT_BOT_ID, "symbol": cfg["symbol"], "side": cfg["side"],
+            "margin_mode": cfg["margin_mode"], "leverage": cfg["leverage"],
+            "status": "stopped", "running": False
         }]
     return jsonify(out)
 
@@ -653,7 +734,7 @@ def bot_config(bot_id):
         "name": name,
         "symbol": raw.get("symbol", "ETH-USDT"),
         "side": "SELL" if str(raw.get("side", "BUY")).upper() == "SELL" else "BUY",
-        "margin_mode": "ISOLATED" if str(raw.get("margin_mode", "CROSS")).upper() == "ISOLATED" else "CROSS",
+        "margin_mode": "ISOLATED" if str(raw.get("margin_mode","CROSS")).upper() == "ISOLATED" else "CROSS",
         "leverage": int(raw.get("leverage", 10)),
         "tp_percent": float(raw.get("tp_percent", 0.5)),
         "repeat_mode": bool(raw.get("repeat_mode", False)),
@@ -666,20 +747,20 @@ def bot_config(bot_id):
         except Exception:
             continue
 
+    # 파일만 저장
     write_bot_config(bot_id, data)
+
+    # 메모리에 로드(Runner가 이미 있으면 설정 반영만)
     bot = get_or_create_bot(bot_id)
     cfg = bot["cfg"]; state = bot["state"]
     load_cfg_into_obj(cfg, data)
     state.repeat_mode = data["repeat_mode"]
 
+    # 거래소 적용은 비동기로 예약(응답 지연 방지)
     if APPLY_ON_SAVE and not SKIP_SETUP:
-        try:
-            client.set_margin_mode(cfg.symbol, cfg.margin_mode)
-            client.set_leverage(cfg.symbol, cfg.leverage)
-        except Exception as e:
-            log(f"⚠️ config 적용 실패({bot_id}): {e}")
+        _EXEC.submit(_apply_exchange_settings_async, cfg)
 
-    return jsonify({"ok": True, "cfg": data})
+    return jsonify({"ok": True, "cfg": data, "apply_scheduled": bool(APPLY_ON_SAVE and not SKIP_SETUP)})
 
 @app.post("/api/bots/<bot_id>/start")
 def start_bot(bot_id):
@@ -701,29 +782,17 @@ def status_bot(bot_id):
     bot = get_or_create_bot(bot_id)
     cfg = bot["cfg"]; state = bot["state"]
 
-    try:    pp, qp = client.get_symbol_filters(cfg.symbol)
-    except: pp, qp = 4, 0
-    try:    mark = float(client.get_mark_price(cfg.symbol))
-    except: mark = None
+    now = _time.time()
+    cache = STATUS_CACHE.get(bot_id)
+    # 캐시가 아주 신선하면 바로 리턴
+    if cache and (now - cache["ts"] <= STATUS_TTL):
+        return jsonify(cache["data"])
 
-    avg, qty = client.position_info(cfg.symbol, cfg.side)
-    exch_lev = client.get_current_leverage(cfg.symbol, cfg.side)
-
-    out = {
-        "running": state.running,
-        "repeat_mode": getattr(state, "repeat_mode", False),
-        "tp_order_id": getattr(state, "tp_order_id", None),
-        "symbol": cfg.symbol,
-        "side": cfg.side,
-        "price_precision": pp,
-        "position_avg_price": avg,
-        "position_qty": qty,
-        "mark_price": mark,
-        "exchange_leverage": exch_lev,
-        "cfg_leverage": cfg.leverage,
-        "dca_config": cfg.dca_config,
-    }
-    return jsonify(out)
+    # 최신값 시도(병렬 + 타임아웃)
+    data = _get_status_live(cfg, state)
+    # 캐시 업데이트
+    STATUS_CACHE[bot_id] = {"ts": now, "data": data}
+    return jsonify(data)
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 9) 디버그 & 로그인
