@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from time import perf_counter
 
-_EXEC = ThreadPoolExecutor(max_workers=4)
+_EXEC = ThreadPoolExecutor(max_workers=3)
 
 # 주별 일별 시리즈
 LAST_WEEKLY = {"series": [], "ts": 0.0}
