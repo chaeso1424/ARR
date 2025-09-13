@@ -1,4 +1,4 @@
-# app.py — A안(봇별 로그) 정리본
+# app.py — A안(봇별 로그) 정리본 (optimized & instrumented)
 import os
 import json, math
 import re
@@ -15,7 +15,10 @@ from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from time import perf_counter
 
-_EXEC = ThreadPoolExecutor(max_workers=5)
+# ───────────────────────────────────────────────────────────────────────────────
+# 0) 스레드풀 / 전역 캐시
+# ───────────────────────────────────────────────────────────────────────────────
+_EXEC = ThreadPoolExecutor(max_workers=5)  # 2 vCPU 기준 4~6 권장
 
 # 주별 일별 시리즈
 LAST_WEEKLY = {"series": [], "ts": 0.0}
@@ -26,7 +29,7 @@ STATUS_CACHE = {}  # { bot_id: {"ts": float, "data": dict} }
 STATUS_TTL = 2.0   # 초
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 0) 환경 로드
+# 1) 환경 로드
 # ───────────────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -39,7 +42,6 @@ from utils.balance_store import (
 )
 from utils.stats import get_stats, reset_stats, get_stats_window, get_profit_window, get_profit_kpi
 
-
 from utils.logging import log
 from models.config import BotConfig
 from models.state import BotState
@@ -48,7 +50,7 @@ from bot.runner import BotRunner
 from flask_cors import CORS
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 1) 경로/상수
+# 2) 경로/상수
 # ───────────────────────────────────────────────────────────────────────────────
 BOTS_DIR = BASE_DIR / "data" / "bots"
 BOTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -60,7 +62,7 @@ DEFAULT_LOG_FILE = BASE_DIR / "logs.txt"  # 공용 로그(옵션)
 ANSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")      # ANSI 컬러 제거
 
 APPLY_ON_SAVE = os.getenv("APPLY_ON_SAVE", "true").lower() == "true"
-SKIP_SETUP   = os.getenv("SKIP_SETUP", "false").lower() == "true"
+SKIP_SETUP   = os.getenv("SKIP_SETUP", "false").lower() == "false" and False  # 안전 기본값 False
 DEFAULT_BOT_ID = "default"
 
 ENABLE_SNAPSHOT_DAEMON = os.getenv("ENABLE_SNAPSHOT_DAEMON", "true").lower() == "true"
@@ -80,22 +82,13 @@ DEFAULT_SUMMARY = {
 # 파일 상단에 추가 (DEFAULT_SUMMARY 아래쯤)
 LAST_SUMMARY = None
 
-def _summary_from_snap(snap):
-    """snap(dict|None)을 안전하게 요약 dict로 변환하고, 숫자는 float로 정규화"""
-    d = snap if isinstance(snap, dict) else {}
-    return {
-        "currency": d.get("asset", "USDT"),
-        "balance": float(d.get("balance", 0) or 0),
-        "equity": float(d.get("equity", 0) or 0),
-        "available_margin": float(d.get("available_margin", 0) or 0),
-    }
-
-
 # ───────────────────────────────────────────────────────────────────────────────
-# 2) Flask 앱/전역
+# 3) Flask 앱/전역
 # ───────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET", "dev")
+# ⚠️ jwt decode/encode 모두 app.config['SECRET_KEY'] 사용 → 확실히 세팅
+app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET', 'dev')
+app.secret_key = app.config['SECRET_KEY']
 
 USERS = {
     "artcokr12345@naver.com": "16430878a!!",
@@ -104,24 +97,67 @@ USERS = {
 client = BingXClient()
 BOTS: dict[str, dict] = {}  # { bot_id: {"cfg": BotConfig, "state": BotState, "runner": BotRunner} }
 
+# ───────────────────────────────────────────────────────────────────────────────
+# 3-1) 경량 타이밍 유틸
+# ───────────────────────────────────────────────────────────────────────────────
+class Span:
+    def __init__(self, name):
+        self.name = name
+        self.t0 = perf_counter()
+        self.dt = None
+    def end(self):
+        self.dt = (perf_counter() - self.t0) * 1000.0
+        return self.dt
+
+def tmark(key: str):
+    if not hasattr(g, '_marks'): g._marks = {}
+    g._marks[key] = perf_counter()
+
+def tdelta(key: str):
+    if not hasattr(g, '_marks'): return None
+    t0 = g._marks.get(key)
+    if t0 is None: return None
+    return (perf_counter() - t0) * 1000.0
+
 @app.before_request
-def _diag_t0():
-    g.__t0 = perf_counter()
-    try:
-        print(f"[BR] {request.method} {request.path} start", flush=True)
-    except Exception:
-        pass
+def _tic():
+    g._t0 = time.time()
+    g._marks = {}
+    tmark('req')
 
 @app.after_request
-def _diag_t1(resp):
+def _toc(resp):
     try:
-        dt = (perf_counter() - getattr(g, "__t0", perf_counter())) * 1000
-        print(f"[AR] {request.method} {request.path} -> {resp.status_code} {dt:.1f}ms", flush=True)
-    finally:
-        return resp
+        dt = (time.time() - getattr(g, "_t0", time.time())) * 1000
+        resp.headers["X-Elapsed-ms"] = f"{dt:.1f}"
+        # 가장 중요한 엔드포인트 일부는 세부 마크도 함께 로깅
+        detail = []
+        for k in getattr(g, '_marks', {}):
+            if k != 'req':
+                d = tdelta(k)
+                if d is not None:
+                    detail.append(f"{k}={d:.1f}ms")
+        detail_s = (" "+" ".join(detail)) if detail else ""
+        print(f"[{request.method}] {request.path} -> {resp.status_code} in {dt:.1f}ms{detail_s}")
+    except Exception:
+        pass
+    return resp
+
+# ✅ CORS 설정: 프론트 dev 도메인 허용 + Authorization 헤더 허용
+CORS(
+    app,
+    resources={
+        r"/api/*": {"origins": ["http://localhost:3000", "http://127.0.0.1:3000", "*"]},
+        r"/logs/*": {"origins": ["http://localhost:3000", "http://127.0.0.1:3000", "*"]},
+    },
+    supports_credentials=False,
+    allow_headers=["Content-Type", "Authorization"],
+    expose_headers=["Content-Type", "X-Elapsed-ms"],
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 3) 인증(토큰)
+# 4) 인증(토큰)
 # ───────────────────────────────────────────────────────────────────────────────
 def token_required(f):
     @wraps(f)
@@ -143,22 +179,8 @@ def token_required(f):
         return f(*args, **kwargs)
     return decorated
 
-# ✅ CORS 설정: 프론트 dev 도메인 허용 + Authorization 헤더 허용
-CORS(
-    app,
-    resources={
-        r"/api/*": {"origins": ["http://localhost:3000", "http://127.0.0.1:3000"]},
-        r"/logs/*": {"origins": ["http://localhost:3000", "http://127.0.0.1:3000"]},
-    },
-    supports_credentials=False,  # 토큰은 Authorization 헤더로 보내므로 보통 False
-    allow_headers=["Content-Type", "Authorization"],
-    expose_headers=["Content-Type"],
-    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-)
-
-
 # ───────────────────────────────────────────────────────────────────────────────
-# 4) 봇 설정 저장/로드 유틸
+# 5) 봇 설정 저장/로드 유틸
 # ───────────────────────────────────────────────────────────────────────────────
 def safe_bot_id(s: str) -> str:
     """파일 경로 안전화"""
@@ -229,7 +251,7 @@ def get_or_create_bot(bot_id: str) -> dict:
 get_or_create_bot(DEFAULT_BOT_ID)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 5) 로그 tail 유틸 (A안: 파일 분리)
+# 6) 로그 tail 유틸 (A안: 파일 분리)
 # ───────────────────────────────────────────────────────────────────────────────
 def _tail_log_lines(path: Path, tail: int, grep: str | None = None, level: str | None = None, strip_ansi: bool = True):
     tail = max(1, min(int(tail or 500), 5000))
@@ -249,69 +271,49 @@ def _tail_log_lines(path: Path, tail: int, grep: str | None = None, level: str |
     return list(lines)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 7) 주별 잔고 시리즈
+# 7) 주별 잔고 시리즈 (캐시 즉시 응답 + 백그라운드 갱신 + 프리워밍)
 # ───────────────────────────────────────────────────────────────────────────────
-
 LAST_DAILY  = {"series": [], "ts": 0.0}
 LAST_WEEKLY = {"series": [], "ts": 0.0}
-MAX_AGE_S   = 60  # 신선 기준(초). 필요에 맞게 조절.
+MAX_AGE_S   = 60  # 신선 기준(초)
 
 def _refresh_daily(days):
+    s = Span("refresh_daily")
     try:
         res = get_daily_series(days)
         LAST_DAILY["series"] = res or []
         LAST_DAILY["ts"] = _time.time()
     except Exception as e:
         print("[daily refresh] error:", e)
+    finally:
+        print(f"[series] daily refreshed in {s.end():.1f}ms, len={len(LAST_DAILY['series'])}")
 
 def _refresh_weekly(weeks):
+    s = Span("refresh_weekly")
     try:
         res = get_weekly_series(weeks)
         LAST_WEEKLY["series"] = res or []
         LAST_WEEKLY["ts"] = _time.time()
     except Exception as e:
         print("[weekly refresh] error:", e)
+    finally:
+        print(f"[series] weekly refreshed in {s.end():.1f}ms, len={len(LAST_WEEKLY['series'])}")
 
-
-def _seconds_until_next_utc_midnight():
-    now = datetime.now(timezone.utc)
-    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    return max(1, int((tomorrow - now).total_seconds()))
-
-def _daily_snapshot_worker():
-    # 주의: gunicorn workers를 1개로 유지 (네가 이미 -w 1 사용)
-    while True:
-        try:
-            snap = client._get_snapshot_cached(min_ttl=0.0)
-            summ = _summary_from_snap(snap)  # None이어도 안전
-            bal = summ["balance"]
-            upsert_daily_snapshot(bal)
-            upsert_weekly_snapshot(bal)
-            print("[snapshot] daily+weekly saved", bal)
-        except Exception as e:
-            print("[snapshot] failed:", e)
-        time.sleep(_seconds_until_next_utc_midnight())
-
-def start_snapshot_daemon_once():
-    # 중복 실행 방지 (단일 프로세스 가정: -w 1)
-    if ENABLE_SNAPSHOT_DAEMON and not getattr(start_snapshot_daemon_once, "_started", False):
-        t = threading.Thread(target=_daily_snapshot_worker, daemon=True)
-        t.start()
-        start_snapshot_daemon_once._started = True
-
-# Flask 앱 생성 직후 어딘가에서 호출
-start_snapshot_daemon_once()
+# 앱 시작 시 캐시 프리워밍(비차단)
+_EXEC.submit(_refresh_daily, 30)
+_EXEC.submit(_refresh_weekly, 12)
 
 @app.get("/api/balance/series")
 def api_balance_series():
+    tmark('series_entry')
     gran = (request.args.get("granularity") or "w").lower()
     now  = _time.time()
     if gran == "d":
         days = int(request.args.get("days", "30") or 30)
         series = LAST_DAILY["series"] or []
         stale  = (now - LAST_DAILY["ts"] > MAX_AGE_S)
-        # 캐시가 비었거나 오래됐으면 백그라운드로 갱신만 트리거(대기 X)
         if stale:
+            print("[series] daily stale → refresh schedule")
             _EXEC.submit(_refresh_daily, days)
         return jsonify({"granularity": "d", "series": series, "stale": stale})
     else:
@@ -319,48 +321,18 @@ def api_balance_series():
         series = LAST_WEEKLY["series"] or []
         stale  = (now - LAST_WEEKLY["ts"] > MAX_AGE_S)
         if stale:
+            print("[series] weekly stale → refresh schedule")
             _EXEC.submit(_refresh_weekly, weeks)
         return jsonify({"granularity": "w", "series": series, "stale": stale})
-    
-def _nonblocking_call(func, *args, timeout=0.8, cache=None):
-    fut = _EXEC.submit(func, *args)
-    try:
-        res = fut.result(timeout=timeout)
-        if cache is not None and res is not None:
-            cache["series"] = res
-            cache["ts"] = _time.time()
-        return res, False  # (결과, stale=False)
-    except TimeoutError:
-        # 느리면 즉시 캐시 반환(있으면)
-        if cache and cache["series"]:
-            return cache["series"], True
-        # 캐시 없으면 빈값
-        return [], True
-    except Exception as e:
-        print("[series] call error:", e)
-        if cache and cache["series"]:
-            return cache["series"], True
-        return [], True
-# ───────────────────────────────────────────────────────────────────────────────
-# 6) “총 거래량 + 체결건수 + (신규 진입 vs DCA) 도넛” / profit chart
-# ───────────────────────────────────────────────────────────────────────────────
 
+# ───────────────────────────────────────────────────────────────────────────────
+# 8) 거래 요약/통계/수익 KPI
+# ───────────────────────────────────────────────────────────────────────────────
 @app.get("/api/trades/summary")
 def api_trades_summary():
-    """
-    /api/trades/summary?window=7d
-    프론트 호환 스키마로 반환:
-    {
-      "total_volume": 0,
-      "fills_count": 0,
-      "entries": {"new": 0, "dca": 0}
-    }
-    """
-    window = (request.args.get("window") or "30d").lower()  # '7d' | '30d' | '4w'
-    # 필요하면 symbols 필터도 지원 가능: symbols=BTC-USDT,ETH-USDT
+    window = (request.args.get("window") or "30d").lower()
     symbols_param = request.args.get("symbols")
     symbols = [s.strip() for s in symbols_param.split(",")] if symbols_param else None
-
     agg = get_stats_window(window=window, symbols=symbols)
     return jsonify({
         "window": window,
@@ -374,16 +346,9 @@ def api_trades_summary():
 
 @app.get("/api/stats")
 def api_stats():
-    """
-    /api/stats?window=7d&symbols=BTC-USDT,ETH-USDT
-    - window: 7d / 30d / 4w (기본 30d)
-    - symbols: 콤마로 구분된 심볼 목록(옵션)
-    """
     window = (request.args.get("window") or "30d").lower()
     symbols_param = request.args.get("symbols")
     symbols = [s.strip() for s in symbols_param.split(",")] if symbols_param else None
-
-    # 기간 지정 시 윈도우 합산 사용
     res = get_stats_window(window=window, symbols=symbols)
     return jsonify(res)
 
@@ -394,7 +359,6 @@ def api_stats_reset():
 
 @app.get("/api/profit/summary")
 def api_profit_summary():
-    # /api/profit/summary?window=30d&baseline=10000&symbols=BTC-USDT,ETH-USDT
     window = request.args.get("window", "30d")
     baseline = request.args.get("baseline")
     baseline_usdt = float(baseline) if baseline is not None else None
@@ -402,16 +366,10 @@ def api_profit_summary():
     symbols_param = request.args.get("symbols")
     symbols = [s.strip() for s in symbols_param.split(",")] if symbols_param else None
 
-    agg = get_stats_window(window=window, symbols=symbols)  # { totals/by_symbol/fills_count/ ... }
+    agg = get_stats_window(window=window, symbols=symbols)
     pnl_usdt = 0.0
     wins = losses = 0
 
-    # TP 이벤트 합계(pnl), 승/패 카운트
-    # utils/stats.py의 events 내부에 pnl 저장해두는 설계여서, window 필터링된 집합으로 합산
-    data_full = get_stats_window(window=window, symbols=symbols)  # 동일 윈도우 이벤트 가져오기
-    # 위 함수가 events를 안 내려주면, 별도로 utils에서 window events를 돌려주는 helper 하나 두어도 좋음
-
-    # 간단 예: utils에 window events getter가 없다면 get_stats() 후 수동 필터
     from utils.stats import _since_ms_from_window, _load, _LOCK
     since_ms = _since_ms_from_window(window, 30)
     with _LOCK:
@@ -433,14 +391,13 @@ def api_profit_summary():
     return jsonify({
         "window": window,
         "pnl_usdt": round(pnl_usdt, 2),
-        "pnl_pct": pnl_pct,           # 프론트가 쓰면 %로, 안 쓰면 무시
+        "pnl_pct": pnl_pct,
         "wins": wins,
         "losses": losses
     })
 
 @app.get("/api/profit/kpi")
 def api_profit_kpi():
-    # /api/profit/kpi?baseline=10000&symbols=BTC-USDT,ETH-USDT
     baseline = request.args.get("baseline")
     baseline_usdt = float(baseline) if baseline is not None else None
 
@@ -451,41 +408,74 @@ def api_profit_kpi():
     return jsonify(data)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 6) 계정 요약(SSE/스냅샷)
+# 9) 계정 요약(SSE/스냅샷)
 # ───────────────────────────────────────────────────────────────────────────────
-
 _LAST_WS_SAVE = 0.0
-def _maybe_upsert_weekly_async(balance, min_interval=300):  # 5분 간격 이상일 때만
+
+def _summary_from_snap(snap):
+    d = snap if isinstance(snap, dict) else {}
+    return {
+        "currency": d.get("asset", "USDT"),
+        "balance": float(d.get("balance", 0) or 0),
+        "equity": float(d.get("equity", 0) or 0),
+        "available_margin": float(d.get("available_margin", 0) or 0),
+    }
+
+def _seconds_until_next_utc_midnight():
+    now = datetime.now(timezone.utc)
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(1, int((tomorrow - now).total_seconds()))
+
+def _daily_snapshot_worker():
+    while True:
+        try:
+            snap = client._get_snapshot_cached(min_ttl=0.0)
+            summ = _summary_from_snap(snap)
+            bal = summ["balance"]
+            upsert_daily_snapshot(bal)
+            upsert_weekly_snapshot(bal)
+            print("[snapshot] daily+weekly saved", bal)
+        except Exception as e:
+            print("[snapshot] failed:", e)
+        time.sleep(_seconds_until_next_utc_midnight())
+
+def start_snapshot_daemon_once():
+    if ENABLE_SNAPSHOT_DAEMON and not getattr(start_snapshot_daemon_once, "_started", False):
+        t = threading.Thread(target=_daily_snapshot_worker, daemon=True)
+        t.start()
+        start_snapshot_daemon_once._started = True
+
+# Flask 앱 생성 직후 어딘가에서 호출
+start_snapshot_daemon_once()
+
+@app.get("/api/account/summary")
+def account_summary():
+    try:
+        tmark('snap')
+        snap = client._get_snapshot_cached(min_ttl=5.0)
+        res = _summary_from_snap(snap)
+        # 주간 스냅샷 저장 (여기서도 None 안전)
+        try:
+            _maybe_upsert_weekly_async(res["balance"])
+        except Exception as e:
+            print("weekly snapshot save failed:", e)
+        # 성공값은 캐시에 보관
+        global LAST_SUMMARY
+        LAST_SUMMARY = res
+        return jsonify(res), 200
+    except Exception as e:
+        global LAST_SUMMARY
+        if LAST_SUMMARY:
+            return jsonify(LAST_SUMMARY), 200
+        return jsonify(_summary_from_snap(None)), 200
+
+def _maybe_upsert_weekly_async(balance, min_interval=300):
     global _LAST_WS_SAVE
     now = _time.time()
     if now - _LAST_WS_SAVE < min_interval:
         return
     _LAST_WS_SAVE = now
     threading.Thread(target=lambda: upsert_weekly_snapshot(balance), daemon=True).start()
-
-@app.get("/api/account/summary")
-def account_summary():
-    global LAST_SUMMARY
-    try:
-        snap = client._get_snapshot_cached(min_ttl=5.0)
-        res = _summary_from_snap(snap)
-
-        # 주간 스냅샷 저장 (여기서도 None 안전)
-        try:
-            _maybe_upsert_weekly_async(res["balance"])
-        except Exception as e:
-            print("weekly snapshot save failed:", e)
-
-        # 성공값은 캐시에 보관
-        LAST_SUMMARY = res
-        return jsonify(res), 200
-
-    except Exception as e:
-        # 예외가 나도 마지막 성공값 또는 기본값으로 200 응답
-        if LAST_SUMMARY:
-            return jsonify(LAST_SUMMARY), 200
-        return jsonify(_summary_from_snap(None)), 200
-
 
 @app.get("/api/account/summary/stream")
 def account_summary_stream():
@@ -505,7 +495,6 @@ def account_summary_stream():
                 else:
                     yield ": keep-alive\n\n"
             except Exception as e:
-                # 에러 시에도 끊지 말고 마지막 값 또는 기본값으로 유지
                 yield f": err {str(e)}\n\n"
                 fallback = LAST_SUMMARY or _summary_from_snap(None)
                 yield f"data: {json.dumps(fallback)}\n\n"
@@ -514,9 +503,8 @@ def account_summary_stream():
     return Response(gen(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
-
 # ───────────────────────────────────────────────────────────────────────────────
-# 7) 로그 API (A안: 봇별 파일 + 파일 화이트리스트)
+# 10) 로그 API (A안: 봇별 파일 + 파일 화이트리스트)
 # ───────────────────────────────────────────────────────────────────────────────
 # 허용 파일 화이트리스트 (필요하면 더 추가)
 FILE_MAP = {
@@ -537,56 +525,37 @@ def _resolve_log_path(bot: str | None, file_key: str | None):
         return LOGS_DIR / f"{safe_bot_id(bot)}.log"
     return DEFAULT_LOG_FILE
 
-
 @app.get("/api/logs")
 def logs_json():
-    """
-    ?tail=500&bot=BOT_ID&file=logs.txt&noansi=1&grep=...&level=...
-    - file이 있으면 화이트리스트에서 해당 파일만 허용 (우선순위 1)
-    - bot이 있으면 backend/{bot}.log (우선순위 2)
-    - 아무 것도 없으면 DEFAULT_LOG_FILE (우선순위 3)
-    - 대상 파일이 없으면 [] 반환 (⚠️ 기본 파일로 대체하지 않음)
-    """
+    tmark('logs')
     tail   = request.args.get("tail", "500")
     bot    = request.args.get("bot")
-    file_k = request.args.get("file")     # ⬅️ 추가
+    file_k = request.args.get("file")
     grep   = request.args.get("grep")
     level  = request.args.get("level")
     noansi = request.args.get("noansi", "1") != "0"
 
     path = _resolve_log_path(bot, file_k)
-
-    # file 키가 화이트리스트에 없으면 400
     if file_k and path is None:
         return jsonify({"error": "unsupported file"}), 400, NO_CACHE_HEADERS
-
-    # 파일 없으면 빈 배열
     if not path or not path.exists():
         return jsonify([]), 200, NO_CACHE_HEADERS
 
     lines = _tail_log_lines(path, tail, grep=grep, level=level, strip_ansi=noansi)
     return jsonify(lines), 200, NO_CACHE_HEADERS
 
-
 @app.get("/logs/text")
 def logs_text():
-    """
-    텍스트 버전:
-    - 파라미터 및 우선순위는 /api/logs와 동일
-    - 파일 없으면 빈 본문
-    """
     tail   = request.args.get("tail", "500")
     bot    = request.args.get("bot")
-    file_k = request.args.get("file")     # ⬅️ 추가
+    file_k = request.args.get("file")
     grep   = request.args.get("grep")
     level  = request.args.get("level")
     noansi = request.args.get("noansi", "1") != "0"
 
     path = _resolve_log_path(bot, file_k)
-
     if file_k and path is None:
         return Response("unsupported file", status=400, mimetype="text/plain", headers=NO_CACHE_HEADERS)
-
     if not path or not path.exists():
         return Response("", mimetype="text/plain", headers=NO_CACHE_HEADERS)
 
@@ -594,9 +563,8 @@ def logs_text():
     body = "\n".join(lines)
     return Response(body, mimetype="text/plain", headers=NO_CACHE_HEADERS)
 
-
 # ───────────────────────────────────────────────────────────────────────────────
-# 8) 다중 봇 API
+# 11) 다중 봇 API (병렬 수집 + 캐시 + 타이밍)
 # ───────────────────────────────────────────────────────────────────────────────
 def _apply_exchange_settings_async(cfg):
     try:
@@ -606,6 +574,7 @@ def _apply_exchange_settings_async(cfg):
         log(f"⚠️ config 적용 실패({getattr(cfg,'symbol',None)}): {e}")
 
 def _get_status_live(cfg, state, timeout_each=0.7):
+    s_all = Span("status_live")
     # 병렬 제출
     fut_ppqp = _EXEC.submit(lambda: client.get_symbol_filters(cfg.symbol))
     fut_mark = _EXEC.submit(lambda: float(client.get_mark_price(cfg.symbol)))
@@ -613,28 +582,42 @@ def _get_status_live(cfg, state, timeout_each=0.7):
     fut_lev  = _EXEC.submit(lambda: client.get_current_leverage(cfg.symbol, cfg.side))
 
     # 개별 타임아웃 수집(타임아웃/에러는 None)
-    def _get(f):
-        try: return f.result(timeout=timeout_each)
-        except: return None
+    def _get(f, name):
+        s = Span(name)
+        try:
+            val = f.result(timeout=timeout_each)
+            return val
+        except Exception as e:
+            print(f"[status] {name} timeout/error: {e}")
+            return None
+        finally:
+            d = s.end()
+            # 50ms 넘는 것만 찍어서 노이즈 감소
+            if d >= 50:
+                print(f"[status] {name} {d:.1f}ms")
 
-    ppqp = _get(fut_ppqp) or (4, 0)
+    ppqp = _get(fut_ppqp, 'ppqp') or (4, 0)
     try:
         pp, qp = int(ppqp[0]), int(ppqp[1])
     except:
         pp, qp = 4, 0
 
-    mark = _get(fut_mark)
+    mark = _get(fut_mark, 'mark')
     if mark is not None:
         try: mark = float(mark)
         except: mark = None
 
-    pos = _get(fut_pos) or (0.0, 0.0)
+    pos = _get(fut_pos, 'pos') or (0.0, 0.0)
     try:
         avg, qty = float(pos[0] or 0.0), float(pos[1] or 0.0)
     except:
         avg, qty = 0.0, 0.0
 
-    exch_lev = _get(fut_lev)
+    exch_lev = _get(fut_lev, 'lev')
+
+    d_all = s_all.end()
+    if d_all >= 100:
+        print(f"[status] aggregate {d_all:.1f}ms")
 
     return {
         "running": state.running,
@@ -653,6 +636,7 @@ def _get_status_live(cfg, state, timeout_each=0.7):
 
 @app.get("/api/bots")
 def list_bots():
+    s = Span("bots_list")
     out = []
     for f in BOTS_DIR.glob("*.json"):
         bot_id = f.stem
@@ -668,7 +652,9 @@ def list_bots():
             "status": "running" if running else "stopped",
             "running": running
         })
-
+    d = s.end()
+    if d >= 50:
+        print(f"[/api/bots] built in {d:.1f}ms (n={len(out)})")
     # 파일이 하나도 없으면 "파일만" 생성하고 리턴 (Runner 생성 X)
     if not out:
         cfg = default_config(DEFAULT_BOT_ID)
@@ -718,7 +704,7 @@ def delete_bot(bot_id):
         lf.unlink()
     return jsonify({"ok": True})
 
-@app.route("/api/bots/<bot_id>/config", methods=["GET", "PUT"])
+@app.route("/api/bots/<bot_id>/config", methods=["GET", "PUT"])  # ← CORS 프리플라이트 용 OPTIONS는 Flask가 자동 처리
 def bot_config(bot_id):
     if request.method == "GET":
         data = read_bot_config(bot_id)
@@ -795,7 +781,7 @@ def status_bot(bot_id):
     return jsonify(data)
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 9) 디버그 & 로그인
+# 12) 디버그 & 로그인
 # ───────────────────────────────────────────────────────────────────────────────
 @app.get("/debug/balance")
 def debug_balance():
@@ -829,8 +815,7 @@ def login():
     return jsonify({"token": token})
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 10) 엔트리포인트
+# 13) 엔트리포인트
 # ───────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app.run(debug=True)
-
