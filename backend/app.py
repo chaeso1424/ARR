@@ -28,6 +28,10 @@ LAST_DAILY  = {"series": [], "ts": 0.0}
 STATUS_CACHE = {}  # { bot_id: {"ts": float, "data": dict} }
 STATUS_TTL = 2.0   # 초
 
+LAST_SUMMARY = None
+LAST_SUMMARY_TS = 0.0
+LAST_SUMMARY_LOCK = threading.Lock()
+
 # ───────────────────────────────────────────────────────────────────────────────
 # 1) 환경 로드
 # ───────────────────────────────────────────────────────────────────────────────
@@ -79,8 +83,6 @@ DEFAULT_SUMMARY = {
     "equity": 0.0,
     "available_margin": 0.0,
 }
-# 파일 상단에 추가 (DEFAULT_SUMMARY 아래쯤)
-LAST_SUMMARY = None
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 3) Flask 앱/전역
