@@ -129,81 +129,129 @@ class BotRunner:
         self.state.position_avg_price = avg
         self.state.position_qty = qty
 
-    def _cancel_tracked_limits(self) -> None:
-        # 1) 우리가 트래킹하던 리밋들부터 취소
+    def _cancel_tracked_limits(
+        self,
+        want_side: str | None = None,    # "BUY"/"SELL" (없으면 self.cfg.side)
+        want_pos:  str | None = None,    # "LONG"/"SHORT" (헷지모드 권장)
+        attempts:  int = 3,              # 재시도 횟수
+        verify_sleep: float = 0.4        # 각 라운드 후 반영 대기
+    ) -> bool:
+        """
+        BingX SWAP v2 기준: 새 사이클 진입 전에 '엔트리 유발 가능' 주문을 깨끗하게 제거.
+        - reduceOnly=True 또는 closePosition=True 인 주문은 제외(청산용).
+        - LIMIT / LIMIT_MAKER / STOP / TAKE_PROFIT / STOP_LOSS_LIMIT / TAKE_PROFIT_LIMIT /
+        STOP_MARKET / TAKE_PROFIT_MARKET (+ 타입 누락 방어) 중 이번 사이클 방향과 일치하는 주문만 취소.
+        - 헷지 모드면 positionSide까지 want_pos와 일치하는 경우만 위험으로 간주.
+        - 추적 ID(self.state.open_limit_ids) 우선 취소 → 심볼 전체 스윕 → 검증 반복.
+        반환: 모두 제거되면 True, 남아 있으면 False
+        """
+        import time
+
+        sym = self.cfg.symbol
+        cfg_side = (self.cfg.side or "BUY").upper()
+        use_side = (want_side or cfg_side).upper()                           # "BUY"/"SELL"
+        use_pos  = (want_pos or ("LONG" if use_side == "BUY" else "SHORT")).upper()
+        hedge    = bool(getattr(self.cfg, "hedge_mode", False))
+        order_tag = getattr(self.cfg, "order_tag", None)  # 내 주문만 취소하고 싶을 때 프리픽스
+
+        def _truthy(x) -> bool:
+            if x is None: return False
+            if isinstance(x, (int, float)): return bool(x)
+            return str(x).strip().lower() in ("true","1","yes","y","t")
+
+        # 0) 우리가 트래킹하던 ID 우선 취소(한 번만)
         for oid in list(self.state.open_limit_ids):
             try:
-                self.client.cancel_order(self.cfg.symbol, oid)
+                self.client.cancel_order(sym, oid)
             except Exception as e:
                 msg = str(e).lower()
-                if any(x in msg for x in ("80018", "not exist", "does not exist", "unknown order", "filled", "canceled", "cancelled")):
+                if any(k in msg for k in ("80018","not exist","does not exist","unknown order","filled","canceled","cancelled")):
                     self._log(f"ℹ️ 건너뜀(이미 정리됨): {oid}")
                 else:
                     self._log(f"⚠️ 리밋 취소 실패: {oid} {e}")
 
-        time.sleep(1.0)  # 취소 반영 대기
+        # 라운드 반복
+        for attempt in range(1, int(max(1, attempts)) + 1):
+            time.sleep(verify_sleep)
 
-        # 2) 심볼 오픈오더 확인
-        try:
-            open_orders = self.client.open_orders(self.cfg.symbol) or []
-        except Exception as e:
-            self._log(f"⚠️ 오픈오더 조회 실패: {e}")
-            self.state.open_limit_ids.clear()
-            return
-
-        # 2-1) 오픈오더가 없으면 종료
-        if not open_orders:
-            self.state.open_limit_ids.clear()
-            return
-
-        # 2-2) '내 포지션 방향'의 진입 리밋만 취소 (TP/반대사이드/다른 포지션은 유지)
-        entry_side = "BUY" if self.cfg.side.upper() == "BUY" else "SELL"   # LONG=BUY, SHORT=SELL
-        entry_pos  = "LONG" if self.cfg.side.upper() == "BUY" else "SHORT"
-
-        seen = set(self.state.open_limit_ids)  # 방금 취소 시도한 것 재시도 방지
-        for o in open_orders:
-            oid = o.get("orderId") or o.get("orderID") or o.get("id")
-            if not oid or oid in seen:
+            # 1) 현재 오픈오더 조회
+            try:
+                open_orders = self.client.open_orders(sym) or []
+            except Exception as e:
+                self._log(f"⚠️ 오픈오더 조회 실패: {e}")
+                # 조회가 실패해도 재시도 라운드 진행
                 continue
 
-            # 주문 속성 파싱
-            o_side = str(o.get("side") or o.get("orderSide") or "").upper()
-            o_pos  = str(o.get("positionSide") or o.get("posSide") or o.get("position_side") or "").upper()
-            o_type = str(o.get("type") or o.get("orderType") or "").upper()
+            # 2) 엔트리-위험 주문 선별
+            danger = []
+            seen = set(self.state.open_limit_ids)  # 직전 취소 재시도 방지용
+            for o in open_orders:
+                oid = o.get("orderId") or o.get("orderID") or o.get("id")
+                if not oid or oid in seen:
+                    continue
 
-            # reduceOnly 다양한 키/타입 지원: True/"true"/1/"1"/"yes" 등
-            ro = o.get("reduceOnly")
-            if ro is None: ro = o.get("reduce_only")
-            if ro is None: ro = o.get("reduceOnlyFlag")
-            try:
-                if isinstance(ro, str):
-                    reduce_only = ro.strip().lower() in ("true", "1", "yes", "y", "t")
-                elif isinstance(ro, (int, float)):
-                    reduce_only = bool(ro)
-                else:
-                    reduce_only = bool(ro)
-            except Exception:
-                reduce_only = False
+                o_side = str(o.get("side") or o.get("orderSide") or "").upper()                # BUY/SELL
+                o_pos  = str(o.get("positionSide") or o.get("posSide") or o.get("position_side") or "").upper()  # LONG/SHORT/""
+                o_typ  = str(o.get("type") or o.get("orderType") or "").upper()
+                reduce_only = _truthy(o.get("reduceOnly") or o.get("reduce_only") or o.get("reduceOnlyFlag"))
+                close_pos   = _truthy(o.get("closePosition"))
 
-            # LIMIT 류만 대상으로 (시장가는 보통 open_orders에 없음)
-            is_limit_like = ("LIMIT" in o_type) or (o_type == "")
+                # 내 주문만 취소하고 싶다면 clientOrderId 접두어 필터
+                if order_tag:
+                    cid = o.get("clientOrderId") or o.get("client_order_id") or ""
+                    if not str(cid).startswith(str(order_tag)):
+                        continue
 
-            # === 취소 조건 ===
-            # 1) 내 포지션 방향과 동일한 주문 사이드 (LONG→BUY, SHORT→SELL)
-            # 2) reduceOnly가 아닌 진입 주문 (TP는 reduceOnly=True이므로 제외)
-            # 3) 포지션사이드가 비어있거나 내 포지션사이드와 같을 때
-            if (o_side == entry_side) and (not reduce_only) and is_limit_like and (not o_pos or o_pos == entry_pos):
+                # 청산류는 제외
+                if reduce_only or close_pos:
+                    continue
+
+                # 엔트리로 오인될 수 있는 타입을 넓게 차단 (+ 타입 누락 방어)
+                is_entryish = (o_typ == "") or any(t in o_typ for t in (
+                    "LIMIT","LIMIT_MAKER",
+                    "STOP","TAKE_PROFIT",
+                    "STOP_LOSS_LIMIT","TAKE_PROFIT_LIMIT",
+                    "STOP_MARKET","TAKE_PROFIT_MARKET"
+                ))
+                if not is_entryish:
+                    continue
+
+                # 이번 사이클 방향 일치만 위험
+                if o_side != use_side:
+                    continue
+
+                # 헷지면 positionSide 일치 필요 (비어있으면 스킵)
+                if hedge:
+                    if not o_pos or o_pos != use_pos:
+                        continue
+
+                danger.append(oid)
+
+            # 3) 위험 주문이 없다 → 성공
+            if not danger:
+                self.state.open_limit_ids.clear()
+                return True
+
+            # 4) 취소 시도
+            cancelled_any = False
+            for oid in danger:
                 try:
-                    self.client.cancel_order(self.cfg.symbol, oid)
+                    self.client.cancel_order(sym, oid)
+                    cancelled_any = True
                 except Exception as e:
                     msg = str(e).lower()
-                    if any(x in msg for x in ("80018", "not exist", "does not exist", "unknown order", "filled", "canceled", "cancelled")):
+                    if any(k in msg for k in ("80018","not exist","does not exist","unknown order","filled","canceled","cancelled")):
                         self._log(f"ℹ️ 건너뜀(이미 정리됨): {oid}")
                     else:
                         self._log(f"⚠️ 오픈오더 취소 실패: {oid} {e}")
 
-        # 3) 최종 clear
+            # 5) 다음 라운드로 재검증. 취소가 전혀 안 먹으면 짧게 추가 대기
+            if not cancelled_any:
+                time.sleep(verify_sleep)
+
+        # 재시도 모두 실패 → 남아있음
         self.state.open_limit_ids.clear()
+        return False
 
 
     # ---------- main loop ----------
@@ -309,7 +357,21 @@ class BotRunner:
                     last_tp_price = self._last_tp_price
                     last_tp_qty = self._last_tp_qty
                 else:
+                    entry_side = "BUY" if side == "BUY" else "SELL"
+                    entry_pos  = "LONG" if side == "BUY" else "SHORT"
+
+                    ok = self._cancel_tracked_limits(
+                        want_side=entry_side,
+                        want_pos=entry_pos,
+                        attempts=3,
+                        verify_sleep=0.4
+                    )
+                    if not ok:
+                        self._log("⚠️ 엔트리 전 오류로 인한 잔여 리밋 정리 실패 ⚠️")
+                        break
+
                     # 2) 1차 시장가 진입
+                    self._cancel_tracked_limits()
                     first_usdt = float(self.cfg.dca_config[0][1])
                     target_notional = first_usdt * float(self.cfg.leverage)
                     raw_qty = target_notional / max(mark * contract, 1e-12)
@@ -701,6 +763,11 @@ class BotRunner:
                         # 트리거(stopPrice)와 수량 계산
                         new_stop = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
                         new_qty  = _safe_close_qty(qty_now, step, min_allowed)
+                        self._refresh_position()
+                        qty_last = float(self.state.position_qty or 0.0)
+                        if qty_last < min_allowed:
+                            log("ⓘ TP skip: position vanished just before placement")
+                            continue
                         new_side = "SELL" if side == "BUY" else "BUY"
                         new_pos  = "LONG" if side == "BUY" else "SHORT"
 

@@ -482,14 +482,16 @@ class BingXClient:
                 last_err = RuntimeError(f"missing orderId in response (variant#{i+1})")
 
             except Exception as e:
-                # 요청 실패: 80001(잔액부족)은 경고 대신 정보 로그로 전환
                 last_err = e
-                s = str(e).lower()
-                if ("80001" in s) or ("insufficient" in s):
-                    from utils.logging import log
+                s = str(e)
+                if ("80001" in s) or ("insufficient" in s.lower()):
                     log(f"ℹ️ order variant#{i+1} skipped (insufficient): {e}")
+                elif "80017" in s or "position not exist" in s.lower():
+                    # 🔽 노이즈 줄이기: 실패(⚠️) 대신 정보 로그로
+                    log(f"ℹ️ order variant#{i+1} skipped (no position): {e}")
+                    # 바로 다음 variant를 시도할 필요도 거의 없음. 보통 호출부에서 정리하므로 break가 맞습니다.
+                    break
                 else:
-                    from utils.logging import log
                     log(f"⚠️ order variant#{i+1} failed: {e}")
                 continue
 
