@@ -448,27 +448,37 @@ def start_snapshot_daemon_once():
 # Flask 앱 생성 직후 어딘가에서 호출
 start_snapshot_daemon_once()
 
-@app.get("/api/account/summary")
-def account_summary():
-    try:
-        tmark('snap')
-        snap = client._get_snapshot_cached(min_ttl=5.0)
-        res = _summary_from_snap(snap)
-        # 주간 스냅샷 저장 (여기서도 None 안전)
-        try:
-            _maybe_upsert_weekly_async(res["balance"])
-        except Exception as e:
-            print("weekly snapshot save failed:", e)
-        # 성공값은 캐시에 보관
-        global LAST_SUMMARY
-        LAST_SUMMARY = res
-        return jsonify(res), 200
-    except Exception as e:
-        global LAST_SUMMARY
-        if LAST_SUMMARY:
-            return jsonify(LAST_SUMMARY), 200
-        return jsonify(_summary_from_snap(None)), 200
+@app.get("/api/account/summary/stream")
+def account_summary_stream():
+    @stream_with_context
+    def gen():
+        yield "retry: 10000\n\n"
+        last = None
+        while True:
+            try:
+                snap = client._get_snapshot_cached(min_ttl=5.0)
+                res = _summary_from_snap(snap)
+                if res != last:
+                    yield f"data: {json.dumps(res)}\n\n"
+                    last = res
+                else:
+                    yield ": keep-alive\n\n"
+            except Exception as e:
+                # 에러 시에도 마지막 값 또는 기본값으로 유지
+                yield f": err {str(e)}\n\n"
+                fallback = LAST_SUMMARY or _summary_from_snap(None)
+                yield f"data: {json.dumps(fallback)}\n\n"
+            time.sleep(10)
 
+    return Response(
+        gen(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 def _maybe_upsert_weekly_async(balance, min_interval=300):
     global _LAST_WS_SAVE
     now = _time.time()
