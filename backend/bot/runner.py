@@ -61,6 +61,16 @@ class BotRunner:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
 
+    # ------------ running or stopped ---------
+    def _beat(self):
+        self.state.last_heartbeat = time.time()
+
+    def _sleep_with_beat(self, total_sec: float, step: float = 1.0):
+        t0 = time.time()
+        while not self._stop and (time.time() - t0) < total_sec:
+            self._beat()
+            time.sleep(min(step, total_sec - (time.time() - t0)))
+
     # ---------- helpers ----------
     def _now(self) -> float:
         return time.time()
@@ -264,6 +274,8 @@ class BotRunner:
         """
         try:
             while not self._stop:
+                self._beat()
+                self._sleep_with_beat(POLL_SEC)
                 try:
                     # 1) 정밀도/스펙 동기화
                     try:
@@ -539,7 +551,8 @@ class BotRunner:
                     did_cleanup = False
 
                     while not self._stop:
-                        time.sleep(POLL_SEC)
+                        self._beat()
+                        self._sleep_with_beat(POLL_SEC)
                         self._refresh_position()
 
                         if not hasattr(self, "_prev_qty_snap"):
@@ -793,7 +806,7 @@ class BotRunner:
                         pass
                     if self._stop:
                         break
-                    time.sleep(300)
+                    self._sleep_with_beat(300.0)
                     continue
         finally:
             self.state.running = False

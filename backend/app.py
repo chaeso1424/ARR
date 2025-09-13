@@ -32,6 +32,10 @@ LAST_SUMMARY = None
 LAST_SUMMARY_TS = 0.0
 LAST_SUMMARY_LOCK = threading.Lock()
 
+RUNNING_GRACE_SEC = float(os.getenv("RUNNING_GRACE_SEC", "6.0"))   # 최근 캐시가 true면 이 시간 동안은 true 유지
+HEARTBEAT_FRESH_SEC = float(os.getenv("HEARTBEAT_FRESH_SEC", "5.0"))  # 하트비트가 이 시간 내면 running으로 간주
+STATUS_TTL          = 1.0   # status 응답 캐시 TTL(초)
+
 # ───────────────────────────────────────────────────────────────────────────────
 # 1) 환경 로드
 # ───────────────────────────────────────────────────────────────────────────────
@@ -581,6 +585,66 @@ def _apply_exchange_settings_async(cfg):
     except Exception as e:
         log(f"⚠️ config 적용 실패({getattr(cfg,'symbol',None)}): {e}")
 
+def _get_status_live(cfg, state, timeout_each=0.7):
+    s_all = Span("status_live")
+    # 병렬 제출
+    fut_ppqp = _EXEC.submit(lambda: client.get_symbol_filters(cfg.symbol))
+    fut_mark = _EXEC.submit(lambda: float(client.get_mark_price(cfg.symbol)))
+    fut_pos  = _EXEC.submit(lambda: client.position_info(cfg.symbol, cfg.side))
+    fut_lev  = _EXEC.submit(lambda: client.get_current_leverage(cfg.symbol, cfg.side))
+
+    # 개별 타임아웃 수집(타임아웃/에러는 None)
+    def _get(f, name):
+        s = Span(name)
+        try:
+            val = f.result(timeout=timeout_each)
+            return val
+        except Exception as e:
+            print(f"[status] {name} timeout/error: {e}")
+            return None
+        finally:
+            d = s.end()
+            # 50ms 넘는 것만 찍어서 노이즈 감소
+            if d >= 50:
+                print(f"[status] {name} {d:.1f}ms")
+
+    ppqp = _get(fut_ppqp, 'ppqp') or (4, 0)
+    try:
+        pp, qp = int(ppqp[0]), int(ppqp[1])
+    except:
+        pp, qp = 4, 0
+
+    mark = _get(fut_mark, 'mark')
+    if mark is not None:
+        try: mark = float(mark)
+        except: mark = None
+
+    pos = _get(fut_pos, 'pos') or (0.0, 0.0)
+    try:
+        avg, qty = float(pos[0] or 0.0), float(pos[1] or 0.0)
+    except:
+        avg, qty = 0.0, 0.0
+
+    exch_lev = _get(fut_lev, 'lev')
+
+    d_all = s_all.end()
+    if d_all >= 100:
+        print(f"[status] aggregate {d_all:.1f}ms")
+
+    return {
+        "running": state.running,
+        "repeat_mode": getattr(state, "repeat_mode", False),
+        "tp_order_id": getattr(state, "tp_order_id", None),
+        "symbol": cfg.symbol,
+        "side": cfg.side,
+        "price_precision": pp,
+        "position_avg_price": avg,
+        "position_qty": qty,
+        "mark_price": mark,
+        "exchange_leverage": exch_lev,
+        "cfg_leverage": cfg.leverage,
+        "dca_config": cfg.dca_config,
+    }
 
 @app.get("/api/bots")
 def list_bots():
@@ -716,29 +780,43 @@ def status_bot(bot_id):
     bot = get_or_create_bot(bot_id)
     cfg = bot["cfg"]; state = bot["state"]
 
-    try:    pp, qp = client.get_symbol_filters(cfg.symbol)
-    except: pp, qp = 4, 0
-    try:    mark = float(client.get_mark_price(cfg.symbol))
-    except: mark = None
+    now = _time.time()
+    cache = STATUS_CACHE.get(bot_id)
 
-    avg, qty = client.position_info(cfg.symbol, cfg.side)
-    exch_lev = client.get_current_leverage(cfg.symbol, cfg.side)
+    # 1) 캐시가 신선하면 바로 반환
+    if cache and (now - cache["ts"] <= STATUS_TTL):
+        return jsonify(cache["data"])
 
-    out = {
-        "running": state.running,
-        "repeat_mode": getattr(state, "repeat_mode", False),
-        "tp_order_id": getattr(state, "tp_order_id", None),
-        "symbol": cfg.symbol,
-        "side": cfg.side,
-        "price_precision": pp,
-        "position_avg_price": avg,
-        "position_qty": qty,
-        "mark_price": mark,
-        "exchange_leverage": exch_lev,
-        "cfg_leverage": cfg.leverage,
-        "dca_config": cfg.dca_config,
-    }
-    return jsonify(out)
+    # 2) 최신값 수집(실패해도 캐시/하트비트로 보정)
+    try:
+        data = _get_status_live(cfg, state)  # running, position, mark 등 포함
+    except Exception as e:
+        # 라이브 수집이 실패하면 캐시를 베이스로 사용
+        data = (cache or {}).get("data", {}) if cache else {}
+        data = dict(data)  # 얕은 복사
+
+    # 3) 하트비트 기반 running 보정
+    last_hb = float(getattr(state, "last_heartbeat", 0.0) or 0.0)
+    heartbeat_fresh = (now - last_hb) < HEARTBEAT_FRESH_SEC
+    effective_running = bool(data.get("running") or heartbeat_fresh)
+
+    # 4) 그레이스 윈도우: 직전 캐시가 True였다면 짧은 False 흔들림 무시
+    if not effective_running and cache:
+        prev_data = cache.get("data", {})
+        prev_ts = cache.get("ts", 0.0)
+        if (prev_data.get("running") is True or prev_data.get("effective_running") is True) \
+           and (now - prev_ts < RUNNING_GRACE_SEC):
+            effective_running = True
+
+    # 5) 응답 보강(프론트는 running만 써도 되고, 디버그용 필드도 같이 제공)
+    data["effective_running"] = effective_running
+    data["running"] = effective_running
+    data["last_heartbeat"] = last_hb
+    data["heartbeat_age_sec"] = round(now - last_hb, 3)
+
+    # 6) 캐시 갱신 후 반환
+    STATUS_CACHE[bot_id] = {"ts": now, "data": data}
+    return jsonify(data)
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 12) 디버그 & 로그인
