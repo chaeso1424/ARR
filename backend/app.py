@@ -452,6 +452,7 @@ start_snapshot_daemon_once()
 
 @app.get("/api/account/summary")
 def account_summary():
+    global LAST_SUMMARY                     # ✅ 함수 맨 첫 줄에 한 번만
     try:
         tmark('snap')
         snap = client._get_snapshot_cached(min_ttl=5.0)
@@ -462,11 +463,10 @@ def account_summary():
         except Exception as e:
             print("weekly snapshot save failed:", e)
         # 성공값은 캐시에 보관
-        global LAST_SUMMARY
-        LAST_SUMMARY = res
+        LAST_SUMMARY = res                  # ← 전역 대입 OK
         return jsonify(res), 200
     except Exception as e:
-        global LAST_SUMMARY
+        # 여기서는 읽기만 하므로 global 불필요 (이미 함수 첫 줄에서 선언됨)
         if LAST_SUMMARY:
             return jsonify(LAST_SUMMARY), 200
         return jsonify(_summary_from_snap(None)), 200
