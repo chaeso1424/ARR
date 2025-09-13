@@ -435,7 +435,7 @@ def _maybe_upsert_weekly_async(balance, min_interval=300):  # 5분 간격 이상
         return
     _LAST_WS_SAVE = now
     threading.Thread(target=lambda: upsert_weekly_snapshot(balance), daemon=True).start()
-    
+
 @app.get("/api/account/summary")
 def account_summary():
     global LAST_SUMMARY
@@ -489,30 +489,52 @@ def account_summary_stream():
 
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 7) 로그 API (A안: 봇별 파일)
+# 7) 로그 API (A안: 봇별 파일 + 파일 화이트리스트)
 # ───────────────────────────────────────────────────────────────────────────────
+# 허용 파일 화이트리스트 (필요하면 더 추가)
+FILE_MAP = {
+    "logs.txt": DEFAULT_LOG_FILE,   # 예: /opt/arr/backend/logs.txt
+}
+
+def _resolve_log_path(bot: str | None, file_key: str | None):
+    """
+    우선순위:
+    1) file_key가 있으면 화이트리스트에서만 허용
+    2) bot이 있으면 backend/{bot}.log
+    3) 없으면 DEFAULT_LOG_FILE
+    """
+    if file_key:
+        p = FILE_MAP.get(str(file_key))
+        return p if p else None
+    if bot:
+        return LOGS_DIR / f"{safe_bot_id(bot)}.log"
+    return DEFAULT_LOG_FILE
+
+
 @app.get("/api/logs")
 def logs_json():
     """
-    ?tail=500&bot=BOT_ID&noansi=1&grep=...&level=...
-    - bot이 있으면 backend/{bot}.log 읽기
-    - bot이 없으면 backend/logs.txt
-    - 대상 파일이 아예 없으면 [] 반환 (⚠️ 기본 파일로 대체하지 않음)
+    ?tail=500&bot=BOT_ID&file=logs.txt&noansi=1&grep=...&level=...
+    - file이 있으면 화이트리스트에서 해당 파일만 허용 (우선순위 1)
+    - bot이 있으면 backend/{bot}.log (우선순위 2)
+    - 아무 것도 없으면 DEFAULT_LOG_FILE (우선순위 3)
+    - 대상 파일이 없으면 [] 반환 (⚠️ 기본 파일로 대체하지 않음)
     """
     tail   = request.args.get("tail", "500")
     bot    = request.args.get("bot")
+    file_k = request.args.get("file")     # ⬅️ 추가
     grep   = request.args.get("grep")
     level  = request.args.get("level")
     noansi = request.args.get("noansi", "1") != "0"
 
-    # 파일 경로 결정
-    if bot:
-        path = LOGS_DIR / f"{safe_bot_id(bot)}.log"
-    else:
-        path = DEFAULT_LOG_FILE
+    path = _resolve_log_path(bot, file_k)
 
-    # 파일 없으면 빈 배열 리턴
-    if not path.exists():
+    # file 키가 화이트리스트에 없으면 400
+    if file_k and path is None:
+        return jsonify({"error": "unsupported file"}), 400, NO_CACHE_HEADERS
+
+    # 파일 없으면 빈 배열
+    if not path or not path.exists():
         return jsonify([]), 200, NO_CACHE_HEADERS
 
     lines = _tail_log_lines(path, tail, grep=grep, level=level, strip_ansi=noansi)
@@ -521,20 +543,30 @@ def logs_json():
 
 @app.get("/logs/text")
 def logs_text():
+    """
+    텍스트 버전:
+    - 파라미터 및 우선순위는 /api/logs와 동일
+    - 파일 없으면 빈 본문
+    """
     tail   = request.args.get("tail", "500")
     bot    = request.args.get("bot")
+    file_k = request.args.get("file")     # ⬅️ 추가
     grep   = request.args.get("grep")
     level  = request.args.get("level")
     noansi = request.args.get("noansi", "1") != "0"
 
-    path = (LOGS_DIR / f"{safe_bot_id(bot)}.log") if bot else DEFAULT_LOG_FILE
-    if not path.exists():
-        # 텍스트는 빈 본문 반환
+    path = _resolve_log_path(bot, file_k)
+
+    if file_k and path is None:
+        return Response("unsupported file", status=400, mimetype="text/plain", headers=NO_CACHE_HEADERS)
+
+    if not path or not path.exists():
         return Response("", mimetype="text/plain", headers=NO_CACHE_HEADERS)
 
     lines = _tail_log_lines(path, tail, grep=grep, level=level, strip_ansi=noansi)
     body = "\n".join(lines)
     return Response(body, mimetype="text/plain", headers=NO_CACHE_HEADERS)
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 8) 다중 봇 API
