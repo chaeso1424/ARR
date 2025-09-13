@@ -866,6 +866,9 @@ class BingXClient:
         - close_position=True면 quantity 없이 전체 청산 (closePosition="true")
         """
         import math, time
+        if qty is not None and float(qty) <= 0:
+            raise RuntimeError("skip TP: qty <= 0 (no position)")
+        
         url = f"{BASE}/openApi/swap/v2/trade/order"
 
         # --- stopPrice 검증/보정 ---
@@ -951,8 +954,8 @@ class BingXClient:
             return True
         except Exception as e:
             msg = str(e)
-            # 80018(이미 존재/존재하지 않음 등) → 로그 없이 무시
-            if "80018" in msg:
+            # 이미 정리된 주문 → 조용히 무시
+            if any(code in msg for code in ("80018", "109414", "not exist", "does not exist", "unknown order")):
                 return False
             log(f"⚠️ cancel_order: {e}")
             return False

@@ -766,8 +766,10 @@ class BotRunner:
                         self._refresh_position()
                         qty_last = float(self.state.position_qty or 0.0)
                         if qty_last < min_allowed:
-                            log("ⓘ TP skip: position vanished just before placement")
+                            self._log("ⓘ TP skip: position vanished just before placement (qty=0)")
                             continue
+                        new_qty  = _safe_close_qty(qty_last, step, min_allowed)
+                        
                         new_side = "SELL" if side == "BUY" else "BUY"
                         new_pos  = "LONG" if side == "BUY" else "SHORT"
 
