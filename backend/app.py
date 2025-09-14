@@ -785,47 +785,48 @@ def status_bot(bot_id):
     now = time.time()
     cache = STATUS_CACHE.get(bot_id)
 
-    # 캐시가 신선하면 그대로 반환
+    # 1) 캐시가 신선하면 그대로 반환
     if cache and (now - cache["ts"] <= STATUS_TTL):
         return jsonify(cache["data"])
 
-    # 라이브 수집 (오류 나면 캐시 기반으로)
+    # 2) 라이브 수집 (실패 시 캐시 베이스)
     try:
-        data = _get_status_live(cfg, state)
+        data = _get_status_live(cfg, state)  # running/pos/mark 등 포함
     except Exception:
         data = dict((cache or {}).get("data", {}))
 
-    # 메모리 하트비트
+    # 3) 하트비트(메모리 + Redis)
     last_hb_mem = float(getattr(state, "last_heartbeat", 0.0) or 0.0)
-
-    # Redis 하트비트(프로세스 공용)
     last_hb_redis = 0.0
     try:
-        v = get_redis().get(f"bot:hb:{bot_id}")
-        if v: last_hb_redis = float(v)
+        rv = get_redis().get(f"bot:hb:{bot_id}")
+        if rv:
+            last_hb_redis = float(rv)
     except Exception:
         pass
 
     last_hb = max(last_hb_mem, last_hb_redis)
     heartbeat_fresh = (now - last_hb) < HEARTBEAT_FRESH_SEC
 
-    # 실행 판단을 하트비트 기반으로 보정
+    # 4) 실행 상태 보정 + 그레이스 윈도우
     effective_running = bool(data.get("running") or heartbeat_fresh)
-
-    # 직전 true면 잠깐의 false 무시(그레이스)
     if not effective_running and cache:
-        prev = cache.get("data", {})
-        if (prev.get("running") is True or prev.get("effective_running") is True) \
-           and (now - cache["ts"] < RUNNING_GRACE_SEC):
+        prev_data = cache.get("data", {})
+        prev_ts = cache.get("ts", 0.0)
+        if (prev_data.get("running") is True or prev_data.get("effective_running") is True) \
+           and (now - prev_ts < RUNNING_GRACE_SEC):
             effective_running = True
 
-    data["effective_running"] = effective_running
-    data["running"] = effective_running
-    data["last_heartbeat"] = last_hb
-    data["heartbeat_age_sec"] = round(now - last_hb, 3)
+    # 5) 응답 필드 정리
+    data["effective_running"]   = effective_running
+    data["running"]             = effective_running  # 프론트 수정 없이 깜빡임 차단
+    data["last_heartbeat"]      = last_hb
+    data["heartbeat_age_sec"]   = round(now - last_hb, 3)
 
+    # 6) 캐시 갱신 후 반환
     STATUS_CACHE[bot_id] = {"ts": now, "data": data}
     return jsonify(data)
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 12) 디버그 & 로그인
