@@ -32,9 +32,9 @@ LAST_SUMMARY = None
 LAST_SUMMARY_TS = 0.0
 LAST_SUMMARY_LOCK = threading.Lock()
 
-RUNNING_GRACE_SEC = float(os.getenv("RUNNING_GRACE_SEC", "6.0"))   # 최근 캐시가 true면 이 시간 동안은 true 유지
-HEARTBEAT_FRESH_SEC = float(os.getenv("HEARTBEAT_FRESH_SEC", "5.0"))  # 하트비트가 이 시간 내면 running으로 간주
-STATUS_TTL          = 1.0   # status 응답 캐시 TTL(초)
+STATUS_TTL = float(os.getenv("STATUS_TTL", "2.5"))          # 캐시 2.5s
+HEARTBEAT_FRESH_SEC = float(os.getenv("HEARTBEAT_FRESH_SEC", "120"))  # 하트비트 유효 120s
+RUNNING_GRACE_SEC = float(os.getenv("RUNNING_GRACE_SEC", "60"))       # 흔들림 완화 60s
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 1) 환경 로드
@@ -784,17 +784,25 @@ def status_bot(bot_id):
     bot = get_or_create_bot(bot_id)
     cfg = bot["cfg"]; state = bot["state"]
 
-    now = time.time()
+    now = _time.time()
     cache = STATUS_CACHE.get(bot_id)
+
+    # 캐시가 신선하면 바로 반환
     if cache and (now - cache["ts"] <= STATUS_TTL):
         return jsonify(cache["data"])
 
-    data = _get_status_live(cfg, state)
+    # 라이브 수집 (실패해도 캐시/하트비트로 보정)
+    try:
+        data = _get_status_live(cfg, state)
+    except Exception:
+        data = dict((cache or {}).get("data", {}))
 
+    # 하트비트 보정
     last_hb = float(getattr(state, "last_heartbeat", 0.0) or 0.0)
     heartbeat_fresh = (now - last_hb) < HEARTBEAT_FRESH_SEC
     effective_running = bool(data.get("running") or heartbeat_fresh)
 
+    # 그레이스 윈도우
     if not effective_running and cache:
         prev = cache.get("data", {})
         if (prev.get("running") is True or prev.get("effective_running") is True) \
@@ -803,6 +811,8 @@ def status_bot(bot_id):
 
     data["effective_running"] = effective_running
     data["running"] = effective_running
+    data["last_heartbeat"] = last_hb
+    data["heartbeat_age_sec"] = round(now - last_hb, 3)
 
     STATUS_CACHE[bot_id] = {"ts": now, "data": data}
     return jsonify(data)
