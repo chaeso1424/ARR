@@ -775,46 +775,35 @@ def stop_bot(bot_id):
     bot["runner"].stop()
     return jsonify({"ok": True})
 
+HEARTBEAT_FRESH_SEC = 60     # 하트비트가 60초 내면 실행중으로 간주
+RUNNING_GRACE_SEC    = 10     # 직전 true였으면 잠깐 false 나와도 10초는 true 유지
+STATUS_TTL           = 2      # 상태 캐시 2초
+
 @app.get("/api/bots/<bot_id>/status")
 def status_bot(bot_id):
     bot = get_or_create_bot(bot_id)
     cfg = bot["cfg"]; state = bot["state"]
 
-    now = _time.time()
+    now = time.time()
     cache = STATUS_CACHE.get(bot_id)
-
-    # 1) 캐시가 신선하면 바로 반환
     if cache and (now - cache["ts"] <= STATUS_TTL):
         return jsonify(cache["data"])
 
-    # 2) 최신값 수집(실패해도 캐시/하트비트로 보정)
-    try:
-        data = _get_status_live(cfg, state)  # running, position, mark 등 포함
-    except Exception as e:
-        # 라이브 수집이 실패하면 캐시를 베이스로 사용
-        data = (cache or {}).get("data", {}) if cache else {}
-        data = dict(data)  # 얕은 복사
+    data = _get_status_live(cfg, state)
 
-    # 3) 하트비트 기반 running 보정
     last_hb = float(getattr(state, "last_heartbeat", 0.0) or 0.0)
     heartbeat_fresh = (now - last_hb) < HEARTBEAT_FRESH_SEC
     effective_running = bool(data.get("running") or heartbeat_fresh)
 
-    # 4) 그레이스 윈도우: 직전 캐시가 True였다면 짧은 False 흔들림 무시
     if not effective_running and cache:
-        prev_data = cache.get("data", {})
-        prev_ts = cache.get("ts", 0.0)
-        if (prev_data.get("running") is True or prev_data.get("effective_running") is True) \
-           and (now - prev_ts < RUNNING_GRACE_SEC):
+        prev = cache.get("data", {})
+        if (prev.get("running") is True or prev.get("effective_running") is True) \
+           and (now - cache["ts"] < RUNNING_GRACE_SEC):
             effective_running = True
 
-    # 5) 응답 보강(프론트는 running만 써도 되고, 디버그용 필드도 같이 제공)
     data["effective_running"] = effective_running
     data["running"] = effective_running
-    data["last_heartbeat"] = last_hb
-    data["heartbeat_age_sec"] = round(now - last_hb, 3)
 
-    # 6) 캐시 갱신 후 반환
     STATUS_CACHE[bot_id] = {"ts": now, "data": data}
     return jsonify(data)
 

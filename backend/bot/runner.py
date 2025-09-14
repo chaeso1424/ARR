@@ -25,6 +25,9 @@ class BotRunner:
         self.client = client
         self._thread: threading.Thread | None = None
         self._stop = False
+        self._hb_thread = None
+        self._hb_stop = False
+        self._lev_checked_this_cycle = False
 
 
         self.bot_id = bot_id
@@ -47,19 +50,33 @@ class BotRunner:
         return self._log(msg)
 
     # ---------- lifecycle ----------
+    def _hb_loop(self):
+        # 메인루프가 블로킹이어도 1초마다 꾸준히 하트비트 갱신
+        while not self._hb_stop:
+            self.state.last_heartbeat = time.time()
+            time.sleep(1.0)
+
     def start(self):
         if self.state.running:
             self._log("ℹ️ 이미 실행 중")
             return
         self._stop = False
+        self._hb_stop = False
+        # 하트비트 쓰레드 먼저 가동
+        self._hb_thread = threading.Thread(target=self._hb_loop, daemon=True)
+        self._hb_thread.start()
+
         self._thread = threading.Thread(target=self._run, daemon=True)
         self.state.running = True
         self._thread.start()
 
     def stop(self):
         self._stop = True
+        self._hb_stop = True
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
+        if self._hb_thread and self._hb_thread.is_alive():
+            self._hb_thread.join(timeout=2)
 
     # ---------- helpers ----------
     def _now(self) -> float:
@@ -264,6 +281,7 @@ class BotRunner:
         """
         try:
             while not self._stop:
+                self._lev_checked_this_cycle = False
                 try:
                     # 1) 정밀도/스펙 동기화
                     try:
@@ -336,18 +354,6 @@ class BotRunner:
                         else:
                             self._log(f" 예산 확인 OK: 필요≈{required:.4f} USDT ≤ 가용≈{av:.4f} USDT")
 
-                    # === 레버리지 검증 (자동조정 없음)
-                    lev_now = self.client.get_current_leverage(self.cfg.symbol, self.cfg.side)
-                    if lev_now is not None:
-                        want = float(self.cfg.leverage)
-                        diff = abs(lev_now - want) / max(want, 1.0)
-                        if diff > 0.02:
-                            self._log(f"⛔ 레버리지 불일치: 설정={want}x, 거래소={lev_now}x → 수량/증거금 오차 발생")
-                            self._log("   거래소 앱/웹에서 해당 심볼의 레버리지를 설정값과 동일하게 맞춘 뒤 다시 시작하세요.")
-                            break
-                    else:
-                        self._log("ℹ️ 현재 포지션이 없어 레버리지 조회값 없음 → 주문 후 다시 검증 예정")
-
                     # === attach 모드: 시장가/DCA 스킵, TP만 확보 ===
                     if attach_mode:
                         self._log(f" 기존 포지션 연결 모드: qty={pre_qty}, avg={pre_avg} → DCA/시장가 스킵, TP 확보")
@@ -373,6 +379,23 @@ class BotRunner:
                         if not ok:
                             self._log("⚠️ 엔트리 전 오류로 인한 잔여 리밋 정리 실패 ⚠️")
                             break
+
+                        if not self._lev_checked_this_cycle:
+                            try:
+                                lev_now = self.client.get_current_leverage(self.cfg.symbol, self.cfg.side)
+                                if lev_now is not None:
+                                    want = float(self.cfg.leverage)
+                                    diff = abs(lev_now - want) / max(want, 1.0)
+                                    if diff > 0.02:
+                                        self._log(f"⛔ 레버리지 불일치: 설정={want}x, 거래소={lev_now}x → 수량/증거금 오차 발생")
+                                        self._log("   거래소 앱/웹에서 해당 심볼의 레버리지를 설정값과 동일하게 맞춘 뒤 다시 시작하세요.")
+                                        break  # 이번 사이클 중단
+                                else:
+                                    self._log("ℹ️ 레버리지 조회값 없음(포지션 없음/일시 실패) → 진입 후 다시 확인 예정")
+                            except Exception as e:
+                                self._log(f"⚠️ 레버리지 확인 생략(일시 오류): {e}")
+                            finally:
+                                self._lev_checked_this_cycle = True
 
                         # 2) 1차 시장가 진입
                         self._cancel_tracked_limits()
