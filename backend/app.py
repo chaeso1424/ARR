@@ -785,17 +785,15 @@ def status_bot(bot_id):
     now = time.time()
     cache = STATUS_CACHE.get(bot_id)
 
-    # 1) 캐시가 신선하면 그대로 반환
     if cache and (now - cache["ts"] <= STATUS_TTL):
         return jsonify(cache["data"])
 
-    # 2) 라이브 수집 (실패 시 캐시 베이스)
     try:
-        data = _get_status_live(cfg, state)  # running/pos/mark 등 포함
+        data = _get_status_live(cfg, state)
     except Exception:
         data = dict((cache or {}).get("data", {}))
 
-    # 3) 하트비트(메모리 + Redis)
+    # 하트비트(메모리 + Redis)
     last_hb_mem = float(getattr(state, "last_heartbeat", 0.0) or 0.0)
     last_hb_redis = 0.0
     try:
@@ -806,9 +804,13 @@ def status_bot(bot_id):
         pass
 
     last_hb = max(last_hb_mem, last_hb_redis)
+
+    # ←← 여기 보강: 둘 다 0인데 state.running True면 임시 보정
+    if last_hb == 0.0 and bool(getattr(state, "running", False)):
+        last_hb = now
+
     heartbeat_fresh = (now - last_hb) < HEARTBEAT_FRESH_SEC
 
-    # 4) 실행 상태 보정 + 그레이스 윈도우
     effective_running = bool(data.get("running") or heartbeat_fresh)
     if not effective_running and cache:
         prev_data = cache.get("data", {})
@@ -817,15 +819,14 @@ def status_bot(bot_id):
            and (now - prev_ts < RUNNING_GRACE_SEC):
             effective_running = True
 
-    # 5) 응답 필드 정리
-    data["effective_running"]   = effective_running
-    data["running"]             = effective_running  # 프론트 수정 없이 깜빡임 차단
-    data["last_heartbeat"]      = last_hb
-    data["heartbeat_age_sec"]   = round(now - last_hb, 3)
+    data["effective_running"] = effective_running
+    data["running"] = effective_running
+    data["last_heartbeat"] = last_hb
+    data["heartbeat_age_sec"] = round(now - last_hb, 3)
 
-    # 6) 캐시 갱신 후 반환
     STATUS_CACHE[bot_id] = {"ts": now, "data": data}
     return jsonify(data)
+
 
 
 # ───────────────────────────────────────────────────────────────────────────────

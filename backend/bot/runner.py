@@ -32,6 +32,8 @@ class BotRunner:
         self._hb_thread = None
         self._hb_stop = False
         self._lev_checked_this_cycle = False
+        self._hb_key = f"bot:hb:{bot_id}"
+
 
         self.bot_id = bot_id
         base = Path(__file__).resolve().parents[1]  # 프로젝트 루트 기준 조정
@@ -63,17 +65,29 @@ class BotRunner:
         return f"bot:hb:{self.bot_id}"
 
     def _hb_loop(self):
-        # 메인루프가 블로킹이어도 1초마다 꾸준히 하트비트 갱신
+        r = None
+        last_log = 0.0
         while not self._hb_stop:
             now = time.time()
+            # 메모리 하트비트
             self.state.last_heartbeat = now
-            # 멀티 워커 환경: Redis에 TTL이 있는 하트비트 기록
-            if getattr(self, "_r", None):
+            # Redis 하트비트 (setex)
+            if r is None:
                 try:
-                    payload = {"ts": now, "running": True}
-                    self._r.setex(self._hb_key(), HB_TTL_SEC, json.dumps(payload))
-                except Exception:
-                    pass
+                    r = get_redis()
+                except Exception as e:
+                    # 30초에 한 번만 로그
+                    if now - last_log > 30:
+                        self._log(f"HB: redis connect fail (will retry): {e}")
+                        last_log = now
+                    r = None
+            if r:
+                try:
+                    r.setex(self._hb_key, int(HB_TTL_SEC), str(now))
+                except Exception as e:
+                    if now - last_log > 30:
+                        self._log(f"HB: redis setex fail: {e}")
+                        last_log = now
             time.sleep(1.0)
 
     def start(self):
@@ -83,13 +97,13 @@ class BotRunner:
         self._stop = False
         self._hb_stop = False
 
-        # ⬇️ Redis 초기 하트비트 (running=True)
-        if getattr(self, "_r", None):
-            try:
-                now = time.time()
-                self._r.setex(self._hb_key(), HB_TTL_SEC, json.dumps({"ts": now, "running": True}))
-            except Exception:
-                pass
+        # 시작하자마자 하트비트 1회 기록(메모리+Redis)
+        now = time.time()
+        self.state.last_heartbeat = now
+        try:
+            get_redis().setex(self._hb_key, int(HB_TTL_SEC), str(now))
+        except Exception:
+            pass
 
         self._hb_thread = threading.Thread(target=self._hb_loop, daemon=True)
         self._hb_thread.start()
