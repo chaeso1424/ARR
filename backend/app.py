@@ -793,7 +793,7 @@ def status_bot(bot_id):
     except Exception:
         data = dict((cache or {}).get("data", {}))
 
-    # 하트비트(메모리 + Redis)
+    # 하트비트 읽기
     last_hb_mem = float(getattr(state, "last_heartbeat", 0.0) or 0.0)
     last_hb_redis = 0.0
     try:
@@ -805,18 +805,18 @@ def status_bot(bot_id):
 
     last_hb = max(last_hb_mem, last_hb_redis)
 
-    # ←← 여기 보강: 둘 다 0인데 state.running True면 임시 보정
-    if last_hb == 0.0 and bool(getattr(state, "running", False)):
-        last_hb = now
+    # ← 여기서 0이면 이전 캐시값으로 대체
+    if last_hb == 0.0 and cache:
+        last_hb = float(cache["data"].get("last_heartbeat", 0.0) or 0.0)
 
     heartbeat_fresh = (now - last_hb) < HEARTBEAT_FRESH_SEC
-
     effective_running = bool(data.get("running") or heartbeat_fresh)
+
+    # 그레이스 윈도우
     if not effective_running and cache:
-        prev_data = cache.get("data", {})
+        prev = cache.get("data", {})
         prev_ts = cache.get("ts", 0.0)
-        if (prev_data.get("running") is True or prev_data.get("effective_running") is True) \
-           and (now - prev_ts < RUNNING_GRACE_SEC):
+        if (prev.get("running") or prev.get("effective_running")) and (now - prev_ts < RUNNING_GRACE_SEC):
             effective_running = True
 
     data["effective_running"] = effective_running
@@ -826,8 +826,6 @@ def status_bot(bot_id):
 
     STATUS_CACHE[bot_id] = {"ts": now, "data": data}
     return jsonify(data)
-
-
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 12) 디버그 & 로그인
