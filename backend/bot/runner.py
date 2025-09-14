@@ -10,7 +10,7 @@ from utils.stats import record_event
 from models.config import BotConfig
 from models.state import BotState
 from services.bingx_client import BingXClient
-from backend.redis_helper import get_redis
+from redis_helper import get_redis
 import os
 
 # ===== 운영 파라미터 =====
