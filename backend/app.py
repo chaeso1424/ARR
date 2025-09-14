@@ -13,6 +13,7 @@ from functools import wraps
 from flask import Flask, request, jsonify, Response, stream_with_context, g
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from redis_helper import get_redis
 from time import perf_counter
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -32,9 +33,9 @@ LAST_SUMMARY = None
 LAST_SUMMARY_TS = 0.0
 LAST_SUMMARY_LOCK = threading.Lock()
 
-STATUS_TTL = float(os.getenv("STATUS_TTL", "2.5"))          # 캐시 2.5s
-HEARTBEAT_FRESH_SEC = float(os.getenv("HEARTBEAT_FRESH_SEC", "120"))  # 하트비트 유효 120s
-RUNNING_GRACE_SEC = float(os.getenv("RUNNING_GRACE_SEC", "60"))       # 흔들림 완화 60s
+HEARTBEAT_FRESH_SEC = float(os.getenv("HEARTBEAT_FRESH_SEC", "120"))
+STATUS_TTL = float(os.getenv("STATUS_TTL", "2.5"))
+RUNNING_GRACE_SEC = float(os.getenv("RUNNING_GRACE_SEC", "60"))
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 1) 환경 로드
@@ -775,34 +776,43 @@ def stop_bot(bot_id):
     bot["runner"].stop()
     return jsonify({"ok": True})
 
-HEARTBEAT_FRESH_SEC = 60     # 하트비트가 60초 내면 실행중으로 간주
-RUNNING_GRACE_SEC    = 10     # 직전 true였으면 잠깐 false 나와도 10초는 true 유지
-STATUS_TTL           = 2      # 상태 캐시 2초
 
 @app.get("/api/bots/<bot_id>/status")
 def status_bot(bot_id):
     bot = get_or_create_bot(bot_id)
     cfg = bot["cfg"]; state = bot["state"]
 
-    now = _time.time()
+    now = time.time()
     cache = STATUS_CACHE.get(bot_id)
 
-    # 캐시가 신선하면 바로 반환
+    # 캐시가 신선하면 그대로 반환
     if cache and (now - cache["ts"] <= STATUS_TTL):
         return jsonify(cache["data"])
 
-    # 라이브 수집 (실패해도 캐시/하트비트로 보정)
+    # 라이브 수집 (오류 나면 캐시 기반으로)
     try:
         data = _get_status_live(cfg, state)
     except Exception:
         data = dict((cache or {}).get("data", {}))
 
-    # 하트비트 보정
-    last_hb = float(getattr(state, "last_heartbeat", 0.0) or 0.0)
+    # 메모리 하트비트
+    last_hb_mem = float(getattr(state, "last_heartbeat", 0.0) or 0.0)
+
+    # Redis 하트비트(프로세스 공용)
+    last_hb_redis = 0.0
+    try:
+        v = get_redis().get(f"bot:hb:{bot_id}")
+        if v: last_hb_redis = float(v)
+    except Exception:
+        pass
+
+    last_hb = max(last_hb_mem, last_hb_redis)
     heartbeat_fresh = (now - last_hb) < HEARTBEAT_FRESH_SEC
+
+    # 실행 판단을 하트비트 기반으로 보정
     effective_running = bool(data.get("running") or heartbeat_fresh)
 
-    # 그레이스 윈도우
+    # 직전 true면 잠깐의 false 무시(그레이스)
     if not effective_running and cache:
         prev = cache.get("data", {})
         if (prev.get("running") is True or prev.get("effective_running") is True) \

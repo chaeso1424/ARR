@@ -2,6 +2,7 @@
 import threading
 import time
 from pathlib import Path
+import json
 
 from utils.logging import log
 from utils.mathx import tp_price_from_roi, floor_to_step, _safe_close_qty
@@ -9,6 +10,7 @@ from utils.stats import record_event
 from models.config import BotConfig
 from models.state import BotState
 from services.bingx_client import BingXClient
+from backend.redis_helper import get_redis
 import os
 
 # ===== 운영 파라미터 =====
@@ -16,6 +18,8 @@ RESTART_DELAY_SEC = int(os.getenv("RESTART_DELAY_SEC", "60"))   # TP 후 다음 
 CLOSE_ZERO_STREAK = int(os.getenv("CLOSE_ZERO_STREAK", "3"))    # 종료 판정에 필요한 연속 0회수
 ZERO_EPS_FACTOR = float(os.getenv("ZERO_EPS_FACTOR", "0.5"))  # 0 판정 여유(최소단위의 50%)
 POLL_SEC = 1.5
+HB_TTL_SEC = 180   # 하트비트 유효시간 (프론트 폴링 3s면 120~180이면 충분)
+
 
 
 class BotRunner:
@@ -29,7 +33,6 @@ class BotRunner:
         self._hb_stop = False
         self._lev_checked_this_cycle = False
 
-
         self.bot_id = bot_id
         base = Path(__file__).resolve().parents[1]  # 프로젝트 루트 기준 조정
 
@@ -39,6 +42,12 @@ class BotRunner:
 
         # 현재 attach 모드 여부를 기록한다. attach 모드에서는 기존 DCA 리밋을 삭제하지 않음.
         self._attach_mode: bool = False
+
+        # ── Redis 핸들러 (멀티 워커 하트비트 공유용)
+        try:
+            self._r = get_redis()
+        except Exception:
+            self._r = None
 
     def _ts_ms(self) -> int:
         return int(time.time() * 1000)
@@ -50,10 +59,21 @@ class BotRunner:
         return self._log(msg)
 
     # ---------- lifecycle ----------
+    def _hb_key(self) -> str:
+        return f"bot:hb:{self.bot_id}"
+
     def _hb_loop(self):
         # 메인루프가 블로킹이어도 1초마다 꾸준히 하트비트 갱신
         while not self._hb_stop:
-            self.state.last_heartbeat = time.time()
+            now = time.time()
+            self.state.last_heartbeat = now
+            # 멀티 워커 환경: Redis에 TTL이 있는 하트비트 기록
+            if getattr(self, "_r", None):
+                try:
+                    payload = {"ts": now, "running": True}
+                    self._r.setex(self._hb_key(), HB_TTL_SEC, json.dumps(payload))
+                except Exception:
+                    pass
             time.sleep(1.0)
 
     def start(self):
@@ -62,7 +82,15 @@ class BotRunner:
             return
         self._stop = False
         self._hb_stop = False
-        # 하트비트 쓰레드 먼저 가동
+
+        # ⬇️ Redis 초기 하트비트 (running=True)
+        if getattr(self, "_r", None):
+            try:
+                now = time.time()
+                self._r.setex(self._hb_key(), HB_TTL_SEC, json.dumps({"ts": now, "running": True}))
+            except Exception:
+                pass
+
         self._hb_thread = threading.Thread(target=self._hb_loop, daemon=True)
         self._hb_thread.start()
 
@@ -77,6 +105,12 @@ class BotRunner:
             self._thread.join(timeout=5)
         if self._hb_thread and self._hb_thread.is_alive():
             self._hb_thread.join(timeout=2)
+        # ⬇️ Redis에 running=False 표시(짧은 TTL)
+        if getattr(self, "_r", None):
+            try:
+                self._r.setex(self._hb_key(), 5, json.dumps({"ts": time.time(), "running": False}))
+            except Exception:
+                pass
 
     # ---------- helpers ----------
     def _now(self) -> float:
@@ -820,4 +854,10 @@ class BotRunner:
                     continue
         finally:
             self.state.running = False
+            # ⬇️ Redis도 정리
+            if getattr(self, "_r", None):
+                try:
+                    self._r.setex(self._hb_key(), 5, json.dumps({"ts": time.time(), "running": False}))
+                except Exception:
+                    pass
             self._log("⏹️ 봇 종료")
