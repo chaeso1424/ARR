@@ -136,30 +136,79 @@ class BotRunner:
 
         self.state.running = False
 
-        # Redis 정리: "내가 쓴 값"일 때만 삭제
+        # ── ⬇️ 여기 추가: 소유권 확보 (CAS + stale 판정) ──
         try:
-            r = getattr(self, "_r", None) or get_redis()
+            r = get_redis()
+            now  = int(time.time())
+            stale_sec = max(int(HB_TTL_SEC) + 60, 240)  # HB TTL보다 여유를 두고 staleness 판단
+
             script = """
             local runkey = KEYS[1]
             local hbkey  = KEYS[2]
             local owner  = ARGV[1]
-            if redis.call("GET", runkey) == owner then
-              redis.call("DEL", runkey)
+            local now    = tonumber(ARGV[2])
+            local hbttl  = tonumber(ARGV[3])
+            local rttl   = tonumber(ARGV[4])
+            local stale  = tonumber(ARGV[5])
+
+            local cur = redis.call("GET", runkey)
+            if not cur then
+            -- 아무도 없음 → 내가 선점
+            redis.call("SETEX", runkey, rttl, owner)
+            redis.call("SETEX", hbkey,  hbttl, cjson.encode({ts=now, owner=owner, running=true}))
+            return "TAKEN"
             end
-            -- HB는 종료마커로 바꿔치기(5초 유지)하되, 소유자만 덮어씀
-            local hbval = redis.call("GET", hbkey)
-            if hbval then
-              local ok = 1
-              -- 소유자 일치 여부 느슨검사: 문자열 비교로 owner 포함 여부 확인
-              if string.find(hbval, owner, 1, true) then
-                redis.call("SETEX", hbkey, 5, cjson.encode({ts=redis.call("TIME")[1], owner=owner, running=false}))
-              end
+
+            -- runkey 존재 → HB 확인
+            local hb = redis.call("GET", hbkey)
+            if not hb then
+            -- HB 없으면 죽었다고 보고 인수
+            redis.call("SETEX", runkey, rttl, owner)
+            redis.call("SETEX", hbkey,  hbttl, cjson.encode({ts=now, owner=owner, running=true}))
+            return "TAKEN_NOHB"
             end
-            return 1
+
+            local ok, obj = pcall(cjson.decode, hb)
+            if not ok then
+            -- HB 깨짐 → 인수
+            redis.call("SETEX", runkey, rttl, owner)
+            redis.call("SETEX", hbkey,  hbttl, cjson.encode({ts=now, owner=owner, running=true}))
+            return "TAKEN_BADHB"
+            end
+
+            if obj.running == false then
+            -- 종료마커 → 인수
+            redis.call("SETEX", runkey, rttl, owner)
+            redis.call("SETEX", hbkey,  hbttl, cjson.encode({ts=now, owner=owner, running=true}))
+            return "TAKEN_ENDED"
+            end
+
+            local ts = tonumber(obj.ts or 0)
+            if ts <= 0 or (now - ts) > stale then
+            -- 오래된 HB → 인수
+            redis.call("SETEX", runkey, rttl, owner)
+            redis.call("SETEX", hbkey,  hbttl, cjson.encode({ts=now, owner=owner, running=true}))
+            return "TAKEN_STALE"
+            end
+
+            -- 아직 살아있음
+            return "BUSY"
             """
-            r.eval(script, 2, self._runkey(), self._hbkey(), self._owner)
+
+            res = r.eval(
+                script, 2,
+                self._runkey(), self._hbkey(),
+                self._owner, str(now), str(HB_TTL_SEC), str(RUN_FLAG_TTL_SEC), str(stale_sec)
+            )
+            if str(res).startswith("BUSY"):
+                self._log("⛔ 다른 인스턴스가 실행 중으로 판단(BUSY). 시작 중단.")
+                return
+            else:
+                self._log(f"🔑 소유권 확보: {res}")
+            self._r = r
         except Exception as e:
-            self._log(f"HB cleanup fail (non-fatal): {e}")
+            self._r = None
+            self._log(f"HB owner-takeover init fail (non-fatal): {e}")
 
 
     # ---------- helpers ----------
