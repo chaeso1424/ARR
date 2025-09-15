@@ -3,6 +3,7 @@ import threading
 import time
 from pathlib import Path
 import json
+import uuid
 
 from utils.logging import log
 from utils.mathx import tp_price_from_roi, floor_to_step, _safe_close_qty
@@ -32,7 +33,7 @@ class BotRunner:
         self._hb_thread = None
         self._hb_stop = False
         self._lev_checked_this_cycle = False
-        self._hb_key = f"bot:hb:{bot_id}"
+        self._owner = f"{uuid.uuid4().hex}"
 
 
         self.bot_id = bot_id
@@ -82,10 +83,8 @@ class BotRunner:
 
             if r:
                 try:
-                    # run-flag는 값 "1"로 저장 (존재 여부가 아니라 값으로 판정)
-                    r.setex(self._runkey(), int(RUN_FLAG_TTL_SEC), "1")
-                    # 하트비트는 타임스탬프 문자열로 저장
-                    r.setex(self._hbkey(),   int(HB_TTL_SEC),      str(ts))
+                    r.setex(self._runkey(), int(RUN_FLAG_TTL_SEC), self._owner)
+                    r.setex(self._hbkey(), int(HB_TTL_SEC), json.dumps({"ts": ts, "owner": self._owner, "running": True}))
                     miss = 0
                 except Exception as e:
                     miss += 1
@@ -108,8 +107,10 @@ class BotRunner:
         self.state.last_heartbeat = now
         try:
             r = get_redis()
-            r.setex(self._runkey(), int(RUN_FLAG_TTL_SEC), "1")
-            r.setex(self._hbkey(),   int(HB_TTL_SEC),      str(now))
+            # run-flag에는 소유자 토큰을 값으로 저장
+            r.setex(self._runkey(), int(RUN_FLAG_TTL_SEC), self._owner)
+            # hb에는 JSON을 저장하여 소유자/타임스탬프/러닝여부를 한 번에 볼 수 있게
+            r.setex(self._hbkey(), int(HB_TTL_SEC), json.dumps({"ts": now, "owner": self._owner, "running": True}))
             self._r = r
         except Exception as e:
             self._r = None
@@ -135,11 +136,28 @@ class BotRunner:
 
         self.state.running = False
 
-        # Redis 정리: run-flag와 HB를 즉시 제거 (잔상에 의한 false-positive 방지)
+        # Redis 정리: "내가 쓴 값"일 때만 삭제
         try:
             r = getattr(self, "_r", None) or get_redis()
-            r.delete(self._runkey())
-            r.delete(self._hbkey())
+            script = """
+            local runkey = KEYS[1]
+            local hbkey  = KEYS[2]
+            local owner  = ARGV[1]
+            if redis.call("GET", runkey) == owner then
+              redis.call("DEL", runkey)
+            end
+            -- HB는 종료마커로 바꿔치기(5초 유지)하되, 소유자만 덮어씀
+            local hbval = redis.call("GET", hbkey)
+            if hbval then
+              local ok = 1
+              -- 소유자 일치 여부 느슨검사: 문자열 비교로 owner 포함 여부 확인
+              if string.find(hbval, owner, 1, true) then
+                redis.call("SETEX", hbkey, 5, cjson.encode({ts=redis.call("TIME")[1], owner=owner, running=false}))
+              end
+            end
+            return 1
+            """
+            r.eval(script, 2, self._runkey(), self._hbkey(), self._owner)
         except Exception as e:
             self._log(f"HB cleanup fail (non-fatal): {e}")
 
@@ -889,7 +907,8 @@ class BotRunner:
             # ⬇️ Redis도 정리
             if getattr(self, "_r", None):
                 try:
-                    self._r.setex(self._hb_key(), 5, json.dumps({"ts": time.time(), "running": False}))
+                    # 종료 직전, 5초짜리 "정상 종료" 마커 남기기 (판독측이 부드럽게 전환)
+                    self._r.setex(self._hbkey(), 5, json.dumps({"ts": time.time(), "running": False}))
                 except Exception:
                     pass
             self._log("⏹️ 봇 종료")
