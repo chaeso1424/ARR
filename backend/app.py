@@ -581,6 +581,46 @@ def logs_text():
 # ───────────────────────────────────────────────────────────────────────────────
 # 11) 다중 봇 API (병렬 수집 + 캐시 + 타이밍)
 # ───────────────────────────────────────────────────────────────────────────────
+def _read_redis_status(bot_id: str):
+    """runkey/hb JSON을 읽고 표준화된 튜플을 반환한다.
+    returns: (run_owner: str|None, hb_obj: dict|None, now: float)
+    hb_obj 예시: {"ts": 1690000000.0, "owner": "...", "running": true/false}
+    """
+    r = None
+    try:
+        r = get_redis()
+    except Exception:
+        return None, None, time.time()
+
+    run_key = f"bot:running:{bot_id}"
+    hb_key  = f"bot:hb:{bot_id}"
+    run_owner = None
+    hb_obj = None
+    try:
+        v_run = r.get(run_key)
+        if v_run:
+            # CAS 적용 이후 runkey 값은 owner 토큰이다.
+            run_owner = v_run if isinstance(v_run, str) else (v_run.decode("utf-8", "ignore"))
+    except Exception:
+        run_owner = None
+
+    try:
+        v_hb = r.get(hb_key)
+        if v_hb:
+            s = v_hb if isinstance(v_hb, str) else v_hb.decode("utf-8", "ignore")
+            try:
+                hb_obj = json.loads(s)
+            except Exception:
+                # 구버전(숫자 타임스탬프 문자열) 호환
+                try:
+                    hb_obj = {"ts": float(s), "owner": None, "running": True}
+                except Exception:
+                    hb_obj = None
+    except Exception:
+        hb_obj = None
+
+    return run_owner, hb_obj, time.time()
+
 def _apply_exchange_settings_async(cfg):
     try:
         client.set_margin_mode(cfg.symbol, cfg.margin_mode)
@@ -652,61 +692,38 @@ def _get_status_live(cfg, state, timeout_each=0.7):
 @app.get("/api/bots")
 def list_bots():
     """
-    봇 목록 + 안정적인 running 판정:
+    봇 목록 + 안정적인 running 판정 (CAS 버전):
     - 메모리 state.running
-    - Redis run-flag:  bot:running:{bot_id} == "1"
-    - Redis heartbeat: bot:hb:{bot_id} 가 최근(HEARTBEAT_FRESH_SEC 이내)
-    셋 중 하나라도 true면 running 으로 간주.
+    - Redis run-flag:  bot:running:{bot_id} == <owner-token>
+    - Redis heartbeat: bot:hb:{bot_id} == {"ts":..., "owner":<owner-token>, "running": true/false}
+    외부 신호 기준은 (runkey-owner == hb.owner) AND (hb.running==True) AND (ts 신선)
+    둘 중 하나(메모리 OR 외부신호)라도 True면 running으로 간주.
     """
-    import time, os
-    HEARTBEAT_FRESH_SEC = int(os.getenv("HEARTBEAT_FRESH_SEC", "120"))
-
+    HEARTBEAT_FRESH = float(os.getenv("HEARTBEAT_FRESH_SEC", "120"))
     s = Span("bots_list")
     out = []
-
-    # Redis 핸들 (없어도 동작하도록 예외 무시)
-    r = None
-    try:
-        from backend.redis_helper import get_redis
-        r = get_redis()
-    except Exception:
-        r = None
-
-    now = time.time()
 
     for f in BOTS_DIR.glob("*.json"):
         bot_id = f.stem
         cfg_data = read_bot_config(bot_id) or default_config(bot_id)
 
         # 1) 메모리 기준
-        running_mem = bool(bot_id in BOTS and BOTS[bot_id]["state"].running)
+        mem_running = bool(bot_id in BOTS and BOTS[bot_id]["state"].running)
 
-        # 2) Redis 기준 (run-flag + heartbeat)
-        running_flag = False
+        # 2) Redis 기준 (owner 일치 + 신선한 HB + running True)
+        run_owner, hb, now = _read_redis_status(bot_id)
         hb_fresh = False
-        if r:
-            try:
-                # run-flag: 다른 워커에서 set(ex=TTL) 중이면 "1"로 존재
-                v = r.get(f"bot:running:{bot_id}")
-                if v is not None:
-                    # 값이 "1"이든 뭐든 존재 자체를 러닝 신호로 취급 (ex 로 주기적으로 갱신됨)
-                    running_flag = True
+        ext_running = False
+        if hb and isinstance(hb, dict):
+            ts = float(hb.get("ts") or 0)
+            hb_owner = hb.get("owner")
+            hb_running = bool(hb.get("running", False))
+            hb_fresh = (ts > 0) and ((now - ts) < HEARTBEAT_FRESH)
+            # 외부신호 running 조건
+            if run_owner and (hb_owner == run_owner) and hb_running and hb_fresh:
+                ext_running = True
 
-                # heartbeat: 최근 갱신이면 신선
-                hb = r.get(f"bot:hb:{bot_id}")
-                if hb:
-                    try:
-                        hb_ts = float(hb)
-                        hb_fresh = (now - hb_ts) < HEARTBEAT_FRESH_SEC
-                    except Exception:
-                        hb_fresh = False
-            except Exception:
-                # Redis 일시 오류시 Redis 신호는 무시
-                running_flag = False
-                hb_fresh = False
-
-        # 3) 최종 판정(세 신호 중 하나라도 True면 running)
-        running_effective = bool(running_mem or running_flag or hb_fresh)
+        running_effective = bool(mem_running or ext_running)
 
         out.append({
             "id": bot_id,
@@ -723,7 +740,6 @@ def list_bots():
     if d >= 50:
         print(f"[/api/bots] built in {d:.1f}ms (n={len(out)})")
 
-    # 파일이 하나도 없으면 "파일만" 생성하고 리턴 (Runner 생성 X)
     if not out:
         cfg = default_config(DEFAULT_BOT_ID)
         write_bot_config(DEFAULT_BOT_ID, cfg)
@@ -734,6 +750,7 @@ def list_bots():
         }]
 
     return jsonify(out)
+
 
 @app.post("/api/bots")
 def create_bot():
@@ -819,59 +836,28 @@ def bot_config(bot_id):
 
 @app.post("/api/bots/<bot_id>/start")
 def start_bot(bot_id):
+    # Runner 준비
     bot = get_or_create_bot(bot_id)
+    runner = bot["runner"]
     state = bot["state"]
-    r = get_redis()
 
-    run_key = f"bot:running:{bot_id}"
-    hb_key  = f"bot:hb:{bot_id}"
-    now = time.time()
+    # 선행 차단 금지: 실제 판정은 runner.start() 내부 CAS에 위임
+    runner.start()
 
-    # 1) 이미 실행 중인지(분산 기준) 먼저 판단
+    # 실행 결과 확인: runkey의 owner가 내 runner._owner와 일치하면 성공
     try:
-        run_flag = r.get(run_key)
-        last_hb = r.get(hb_key)
-        last_hb = float(last_hb) if last_hb is not None else 0.0
+        r = get_redis()
+        run_owner = r.get(runner._runkey())
+        if isinstance(run_owner, bytes):
+            run_owner = run_owner.decode("utf-8", "ignore")
+        if run_owner == runner._owner:
+            return jsonify({"ok": True, "msg": "started"})
+        else:
+            # 다른 인스턴스가 선점 중 (BUSY)
+            return jsonify({"ok": False, "msg": "busy (another owner)"}), 409
     except Exception:
-        run_flag = None
-        last_hb = 0.0
-
-    fresh = (now - last_hb) < HEARTBEAT_FRESH_SEC
-
-    # 2) 러닝 플래그가 있고 하트비트가 신선하면 이미 실행 중 → 거절
-    if run_flag == "1" and fresh:
-        return jsonify({"ok": False, "msg": "already running"}), 409
-
-    # 3) 고아 상태면(하트비트 오래됨) 플래그 정리
-    if run_flag == "1" and not fresh:
-        try:
-            r.delete(run_key)
-        except Exception:
-            pass
-
-    # 4) 원자적 획득: 같은 시점에 여러 워커가 와도 1개만 성공
-    #    NX + EX 로 러닝 플래그 세팅
-    try:
-        acquired = r.set(run_key, "1", nx=True, ex=RUN_FLAG_TTL_SEC)
-    except Exception:
-        acquired = None
-
-    if not acquired:
-        # 누군가 이미 선점
-        return jsonify({"ok": False, "msg": "already running"}), 409
-
-    # 5) 프로세스 내 상태도 체크(이건 보조용)
-    if state.running:
-        # 메모리 상으론 이미 실행중 → Redis 플래그 되돌림
-        try:
-            r.delete(run_key)
-        except Exception:
-            pass
-        return jsonify({"ok": False, "msg": "already running"}), 409
-
-    # 6) 실제 구동
-    bot["runner"].start()
-    return jsonify({"ok": True})
+        # Redis 점검이 실패해도, runner는 기동됐을 수 있으므로 낙관적으로 OK 반환
+        return jsonify({"ok": True, "msg": "started (redis-check skipped)"}), 200
 
 @app.post("/api/bots/<bot_id>/stop")
 def stop_bot(bot_id):
@@ -885,52 +871,43 @@ def status_bot(bot_id):
     bot = get_or_create_bot(bot_id)
     cfg = bot["cfg"]; state = bot["state"]
 
-    import time, os
     now = time.time()
-    HEARTBEAT_FRESH_SEC = int(os.getenv("HEARTBEAT_FRESH_SEC", "120"))
+    HEARTBEAT_FRESH = float(os.getenv("HEARTBEAT_FRESH_SEC", "120"))
+    GRACE = float(os.getenv("RUNNING_GRACE_SEC", "60"))
 
     cache = STATUS_CACHE.get(bot_id)
     if cache and (now - cache["ts"] <= STATUS_TTL):
         return jsonify(cache["data"])
 
-    # 라이브 수집 (오류 나면 캐시 기반)
+    # 라이브 수집
     try:
         data = _get_status_live(cfg, state)
     except Exception:
         data = dict((cache or {}).get("data", {}))
 
-    # --- 메모리 running
+    # 1) 메모리 running
     mem_running = bool(getattr(state, "running", False))
 
-    # --- Redis에서 run-flag와 heartbeat
-    runflag = False
+    # 2) Redis 외부 신호 (CAS 체계)
+    run_owner, hb, now2 = _read_redis_status(bot_id)
     hb_ts = 0.0
-    try:
-        r = get_redis()
-        v_flag = r.get(f"bot:running:{bot_id}")      # 값이 "1"일 때만 인정
-        v_hb   = r.get(f"bot:hb:{bot_id}")           # float timestamp
-        if v_flag is not None and v_flag.decode(errors="ignore") == "1":
-            runflag = True
-        if v_hb:
-            try:
-                hb_ts = float(v_hb)
-            except Exception:
-                hb_ts = 0.0
-    except Exception:
-        pass
+    ext_running = False
+    if hb and isinstance(hb, dict):
+        hb_ts = float(hb.get("ts") or 0.0)
+        hb_fresh = (hb_ts > 0.0) and ((now2 - hb_ts) < HEARTBEAT_FRESH)
+        hb_owner = hb.get("owner")
+        hb_running = bool(hb.get("running", False))
+        if run_owner and (hb_owner == run_owner) and hb_running and hb_fresh:
+            ext_running = True
 
-    # --- heartbeat 신선도
-    heartbeat_fresh = (hb_ts > 0.0) and ((now - hb_ts) < HEARTBEAT_FRESH_SEC)
+    # 3) 최종 판정
+    effective_running = bool(mem_running or ext_running)
 
-    # --- 최종 판정: runflag + HB 둘 다 만족해야 외부 신호로 러닝 인정
-    effective_running = bool(mem_running or (runflag and heartbeat_fresh))
-
-    # 캐시 그레이스 (직전 true면 짧은 흔들림 무시)
+    # 그레이스: 직전 true면 짧은 흔들림 무시
     if not effective_running and cache:
         prev = cache.get("data", {})
         prev_ts = cache.get("ts", 0.0)
-        if (prev.get("running") is True or prev.get("effective_running") is True) \
-           and (now - prev_ts < RUNNING_GRACE_SEC):
+        if (prev.get("running") is True or prev.get("effective_running") is True) and (now - prev_ts < GRACE):
             effective_running = True
 
     data["effective_running"] = effective_running
