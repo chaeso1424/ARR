@@ -20,6 +20,7 @@ ZERO_EPS_FACTOR = float(os.getenv("ZERO_EPS_FACTOR", "0.5"))  # 0 판정 여유(
 POLL_SEC = 1.5
 HB_TTL_SEC = 180   # 하트비트 유효시간 (프론트 폴링 3s면 120~180이면 충분)
 
+RUN_FLAG_TTL_SEC = 300  # app.py와 동일 값
 
 
 class BotRunner:
@@ -66,45 +67,49 @@ class BotRunner:
 
     def _hb_loop(self):
         r = None
-        last_log = 0.0
+        try:
+            r = get_redis()
+        except Exception:
+            r = None
+
+        miss = 0
         while not self._hb_stop:
-            now = time.time()
-            # 메모리 하트비트
-            self.state.last_heartbeat = now
-            # Redis 하트비트 (setex)
-            if r is None:
-                try:
-                    r = get_redis()
-                except Exception as e:
-                    # 30초에 한 번만 로그
-                    if now - last_log > 30:
-                        self._log(f"HB: redis connect fail (will retry): {e}")
-                        last_log = now
-                    r = None
+            ts = time.time()
+            self.state.last_heartbeat = ts
+            # Redis: 하트비트 + 러닝 플래그 TTL 연장
             if r:
                 try:
-                    r.setex(self._hb_key, int(HB_TTL_SEC), str(now))
+                    r.setex(f"bot:hb:{self.bot_id}", 180, str(ts))
+                    r.expire(f"bot:running:{self.bot_id}", RUN_FLAG_TTL_SEC)
+                    miss = 0
                 except Exception as e:
-                    if now - last_log > 30:
-                        self._log(f"HB: redis setex fail: {e}")
-                        last_log = now
+                    miss += 1
+                    if miss % 10 == 1:
+                        self._log(f"HB: redis set fail x{miss}: {e}")
             time.sleep(1.0)
 
     def start(self):
         if self.state.running:
             self._log("ℹ️ 이미 실행 중")
             return
+
         self._stop = False
         self._hb_stop = False
 
-        # 시작하자마자 하트비트 1회 기록(메모리+Redis)
+        # 시작 직후 하트비트 1회(메모리 + Redis), 러닝 플래그도 세팅
         now = time.time()
         self.state.last_heartbeat = now
         try:
-            get_redis().setex(self._hb_key, int(HB_TTL_SEC), str(now))
-        except Exception:
-            pass
+            r = get_redis()
+            r.setex(f"bot:hb:{self.bot_id}", int(HB_TTL_SEC), str(now))
+            # run-flag 는 TTL을 둔 채로 세팅 (start API에서 락을 잡았다면 여긴 보완용)
+            r.set(f"bot:running:{self.bot_id}", "1", ex=RUN_FLAG_TTL_SEC)
+            self._r = r
+        except Exception as e:
+            self._r = None
+            self._log(f"HB init fail (non-fatal): {e}")
 
+        # 하트비트 쓰레드 & 메인 쓰레드 시작
         self._hb_thread = threading.Thread(target=self._hb_loop, daemon=True)
         self._hb_thread.start()
 
@@ -115,16 +120,20 @@ class BotRunner:
     def stop(self):
         self._stop = True
         self._hb_stop = True
+
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
         if self._hb_thread and self._hb_thread.is_alive():
             self._hb_thread.join(timeout=2)
-        # ⬇️ Redis에 running=False 표시(짧은 TTL)
-        if getattr(self, "_r", None):
-            try:
-                self._r.setex(self._hb_key(), 5, json.dumps({"ts": time.time(), "running": False}))
-            except Exception:
-                pass
+
+        # Redis 정리: run-flag 제거 + HB를 짧게 남겨 프론트가 자연히 false로 전이
+        try:
+            r = getattr(self, "_r", None) or get_redis()
+            r.delete(f"bot:running:{self.bot_id}")
+            r.setex(f"bot:hb:{self.bot_id}", 5, str(time.time()))
+        except Exception as e:
+            self._log(f"HB cleanup fail (non-fatal): {e}")
+
 
     # ---------- helpers ----------
     def _now(self) -> float:
