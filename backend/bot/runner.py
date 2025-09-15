@@ -16,11 +16,10 @@ import os
 # ===== 운영 파라미터 =====
 RESTART_DELAY_SEC = int(os.getenv("RESTART_DELAY_SEC", "60"))   # TP 후 다음 사이클 대기
 CLOSE_ZERO_STREAK = int(os.getenv("CLOSE_ZERO_STREAK", "3"))    # 종료 판정에 필요한 연속 0회수
-ZERO_EPS_FACTOR = float(os.getenv("ZERO_EPS_FACTOR", "0.5"))  # 0 판정 여유(최소단위의 50%)
-POLL_SEC = 1.5
-HB_TTL_SEC = 180   # 하트비트 유효시간 (프론트 폴링 3s면 120~180이면 충분)
-
-RUN_FLAG_TTL_SEC = 300  # app.py와 동일 값
+ZERO_EPS_FACTOR   = float(os.getenv("ZERO_EPS_FACTOR", "0.5"))  # 0 판정 여유(최소단위의 50%)
+POLL_SEC          = 1.5
+HB_TTL_SEC        = 180  # 하트비트 TTL
+RUN_FLAG_TTL_SEC  = 180  # run-flag TTL
 
 
 class BotRunner:
@@ -62,11 +61,14 @@ class BotRunner:
         return self._log(msg)
 
     # ---------- lifecycle ----------
-    def _hb_key(self) -> str:
+    def _runkey(self) -> str:
+        return f"bot:running:{self.bot_id}"
+
+    def _hbkey(self) -> str:
         return f"bot:hb:{self.bot_id}"
 
     def _hb_loop(self):
-        r = None
+        """메인 루프와 무관하게 1초마다 하트비트/러닝플래그를 Redis에 갱신."""
         try:
             r = get_redis()
         except Exception:
@@ -75,20 +77,25 @@ class BotRunner:
         miss = 0
         while not self._hb_stop:
             ts = time.time()
+            # 메모리 하트비트도 매초 갱신 (같은 프로세스에서 즉시 참조 가능)
             self.state.last_heartbeat = ts
-            # Redis: 하트비트 + 러닝 플래그 TTL 연장
+
             if r:
                 try:
-                    r.setex(f"bot:hb:{self.bot_id}", 180, str(ts))
-                    r.expire(f"bot:running:{self.bot_id}", RUN_FLAG_TTL_SEC)
+                    # run-flag는 값 "1"로 저장 (존재 여부가 아니라 값으로 판정)
+                    r.setex(self._runkey(), int(RUN_FLAG_TTL_SEC), "1")
+                    # 하트비트는 타임스탬프 문자열로 저장
+                    r.setex(self._hbkey(),   int(HB_TTL_SEC),      str(ts))
                     miss = 0
                 except Exception as e:
                     miss += 1
                     if miss % 10 == 1:
                         self._log(f"HB: redis set fail x{miss}: {e}")
+
             time.sleep(1.0)
 
     def start(self):
+        """봇 시작: 메모리/Redis 상태를 먼저 세팅한 뒤 쓰레드 기동."""
         if self.state.running:
             self._log("ℹ️ 이미 실행 중")
             return
@@ -96,20 +103,19 @@ class BotRunner:
         self._stop = False
         self._hb_stop = False
 
-        # 시작 직후 하트비트 1회(메모리 + Redis), 러닝 플래그도 세팅
+        # 시작 직후 1회 기록(메모리 + Redis)
         now = time.time()
         self.state.last_heartbeat = now
         try:
             r = get_redis()
-            r.setex(f"bot:hb:{self.bot_id}", int(HB_TTL_SEC), str(now))
-            # run-flag 는 TTL을 둔 채로 세팅 (start API에서 락을 잡았다면 여긴 보완용)
-            r.set(f"bot:running:{self.bot_id}", "1", ex=RUN_FLAG_TTL_SEC)
+            r.setex(self._runkey(), int(RUN_FLAG_TTL_SEC), "1")
+            r.setex(self._hbkey(),   int(HB_TTL_SEC),      str(now))
             self._r = r
         except Exception as e:
             self._r = None
             self._log(f"HB init fail (non-fatal): {e}")
 
-        # 하트비트 쓰레드 & 메인 쓰레드 시작
+        # 하트비트 쓰레드 → 메인 쓰레드 순으로 기동
         self._hb_thread = threading.Thread(target=self._hb_loop, daemon=True)
         self._hb_thread.start()
 
@@ -118,6 +124,7 @@ class BotRunner:
         self._thread.start()
 
     def stop(self):
+        """봇 정지: 쓰레드 정리 후 Redis 키를 즉시 삭제."""
         self._stop = True
         self._hb_stop = True
 
@@ -126,11 +133,13 @@ class BotRunner:
         if self._hb_thread and self._hb_thread.is_alive():
             self._hb_thread.join(timeout=2)
 
-        # Redis 정리: run-flag 제거 + HB를 짧게 남겨 프론트가 자연히 false로 전이
+        self.state.running = False
+
+        # Redis 정리: run-flag와 HB를 즉시 제거 (잔상에 의한 false-positive 방지)
         try:
             r = getattr(self, "_r", None) or get_redis()
-            r.delete(f"bot:running:{self.bot_id}")
-            r.setex(f"bot:hb:{self.bot_id}", 5, str(time.time()))
+            r.delete(self._runkey())
+            r.delete(self._hbkey())
         except Exception as e:
             self._log(f"HB cleanup fail (non-fatal): {e}")
 

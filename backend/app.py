@@ -885,54 +885,61 @@ def status_bot(bot_id):
     bot = get_or_create_bot(bot_id)
     cfg = bot["cfg"]; state = bot["state"]
 
+    import time, os
     now = time.time()
-    cache = STATUS_CACHE.get(bot_id)
+    HEARTBEAT_FRESH_SEC = int(os.getenv("HEARTBEAT_FRESH_SEC", "120"))
 
+    cache = STATUS_CACHE.get(bot_id)
     if cache and (now - cache["ts"] <= STATUS_TTL):
         return jsonify(cache["data"])
 
+    # 라이브 수집 (오류 나면 캐시 기반)
     try:
         data = _get_status_live(cfg, state)
     except Exception:
         data = dict((cache or {}).get("data", {}))
 
-    # 하트비트(메모리 + Redis)
-    last_hb_mem = float(getattr(state, "last_heartbeat", 0.0) or 0.0)
-    last_hb_redis = 0.0
+    # --- 메모리 running
+    mem_running = bool(getattr(state, "running", False))
+
+    # --- Redis에서 run-flag와 heartbeat
+    runflag = False
+    hb_ts = 0.0
     try:
-        rv = get_redis().get(f"bot:hb:{bot_id}")
-        if rv:
-            last_hb_redis = float(rv)
+        r = get_redis()
+        v_flag = r.get(f"bot:running:{bot_id}")      # 값이 "1"일 때만 인정
+        v_hb   = r.get(f"bot:hb:{bot_id}")           # float timestamp
+        if v_flag is not None and v_flag.decode(errors="ignore") == "1":
+            runflag = True
+        if v_hb:
+            try:
+                hb_ts = float(v_hb)
+            except Exception:
+                hb_ts = 0.0
     except Exception:
         pass
 
-    last_hb = max(last_hb_mem, last_hb_redis)
+    # --- heartbeat 신선도
+    heartbeat_fresh = (hb_ts > 0.0) and ((now - hb_ts) < HEARTBEAT_FRESH_SEC)
 
-    if last_hb == 0.0:
-        # 캐시가 있으면 그대로 반환 (running 값 유지)
-        if cache:
-            return jsonify(cache["data"])
-        # 캐시가 없으면 최소한의 구조만 반환 (running/effective_running 없음)
-        return jsonify({})
+    # --- 최종 판정: runflag + HB 둘 다 만족해야 외부 신호로 러닝 인정
+    effective_running = bool(mem_running or (runflag and heartbeat_fresh))
 
-    heartbeat_fresh = (now - last_hb) < HEARTBEAT_FRESH_SEC
-
-    effective_running = bool(data.get("running") or heartbeat_fresh)
+    # 캐시 그레이스 (직전 true면 짧은 흔들림 무시)
     if not effective_running and cache:
-        prev_data = cache.get("data", {})
+        prev = cache.get("data", {})
         prev_ts = cache.get("ts", 0.0)
-        if (prev_data.get("running") is True or prev_data.get("effective_running") is True) \
+        if (prev.get("running") is True or prev.get("effective_running") is True) \
            and (now - prev_ts < RUNNING_GRACE_SEC):
             effective_running = True
 
     data["effective_running"] = effective_running
     data["running"] = effective_running
-    data["last_heartbeat"] = last_hb
-    data["heartbeat_age_sec"] = round(now - last_hb, 3)
+    data["last_heartbeat"] = hb_ts or float(getattr(state, "last_heartbeat", 0.0) or 0.0)
+    data["heartbeat_age_sec"] = round(now - (data["last_heartbeat"] or 0.0), 3)
 
     STATUS_CACHE[bot_id] = {"ts": now, "data": data}
     return jsonify(data)
-
 
 
 # ───────────────────────────────────────────────────────────────────────────────
