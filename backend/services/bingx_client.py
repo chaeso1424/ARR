@@ -6,6 +6,7 @@ import hashlib
 import requests
 import uuid, json
 import datetime
+from typing import Optional
 from urllib.parse import urlencode
 from utils.logging import log
 from requests.adapters import HTTPAdapter
@@ -49,12 +50,17 @@ _session.mount("http://", _adapter)
 
 # ---- 서버 시간 오프셋(ms) ----
 _SERVER_OFFSET_MS = 0
+# 선물/스왑/스팟 후보 엔드포인트 (그대로 유지 가능)
 _SERVER_TIME_PATHS = [
-    # 선물/스왑 쪽 서버타임 엔드포인트 후보 (문서/배포에 따라 다를 수 있으므로 여러 개 시도)
     "/openApi/swap/v2/server/time",
     "/openApi/common/server/time",
     "/openApi/spot/v1/common/time",
 ]
+
+# 동기화 스레드 관리용 전역
+_TIME_SYNC_LOCK = threading.Lock()
+_TIME_SYNC_THREAD: Optional[threading.Thread] = None
+_TIME_SYNC_STOP = threading.Event()
 
 # === Resilience settings ===
 # 재시도 횟수 / 간격은 환경변수로 조절 가능
@@ -82,6 +88,7 @@ def _should_retry(err: Exception) -> bool:
     )
     return any(h in s for h in hints)
 
+# 서버 시간 동기화 로직
 def _sync_server_time_once():
     """여러 경로를 순차 시도해서 서버 타임(ms)과 로컬 차이를 보정."""
     global _SERVER_OFFSET_MS
@@ -118,24 +125,67 @@ def _sync_server_time_once():
         pass
     return False
 
-# 프로세스 시작 시 1회 시도 + 주기적 보정(10분)
-def _start_server_time_sync_daemon():
-    import threading
-    def _loop():
-        # 첫 시도
-        _sync_server_time_once()
-        # 이후 주기 보정
-        while True:
-            time.sleep(600)  # 10분
-            try:
-                _sync_server_time_once()
-            except Exception:
-                pass
-    t = threading.Thread(target=_loop, daemon=True)
-    t.start()
+def start_server_time_sync(interval_sec: int = 600, jitter_sec: int = 0) -> bool:
+    """
+    서버 시간 동기화 데몬을 시작. 이미 실행 중이면 아무 것도 하지 않고 False 반환.
+    interval_sec: 주기(초). 기본 600초(10분).
+    jitter_sec:   최초 시작 지터(0~jitter_sec 랜덤 대기)로 동시다발 호출 완화.
+    """
+    global _TIME_SYNC_THREAD
+    with _TIME_SYNC_LOCK:
+        if _TIME_SYNC_THREAD and _TIME_SYNC_THREAD.is_alive():
+            return False  # 이미 실행 중
 
-# 모듈 import 시 백그라운드 동기화 시작
-_start_server_time_sync_daemon()
+        _TIME_SYNC_STOP.clear()
+
+        def _loop():
+            try:
+                if jitter_sec > 0:
+                    time.sleep(random.uniform(0, float(jitter_sec)))
+                _sync_server_time_once()
+                while not _TIME_SYNC_STOP.wait(interval_sec):
+                    try:
+                        _sync_server_time_once()
+                    except Exception as e:
+                        try:
+                            log(f"⚠️ server time sync error: {e}")
+                        except Exception:
+                            pass
+            finally:
+                # 종료 시 포인터 정리
+                with _TIME_SYNC_LOCK:
+                    # 현재 스레드가 우리가 추적하던 스레드면 None으로 리셋
+                    if threading.current_thread() is _TIME_SYNC_THREAD:
+                        _TIME_SYNC_THREAD = None
+
+        t = threading.Thread(
+            target=_loop,
+            name="bingx-time-sync",
+            daemon=True,
+        )
+        t.start()
+        _TIME_SYNC_THREAD = t
+        return True
+
+def stop_server_time_sync(join_timeout: float | None = 1.0):
+    """동기화 데몬 중지. 이미 중지 상태여도 안전."""
+    global _TIME_SYNC_THREAD
+    _TIME_SYNC_STOP.set()
+    with _TIME_SYNC_LOCK:
+        t = _TIME_SYNC_THREAD
+    if t and t.is_alive():
+        try:
+            t.join(join_timeout)
+        except Exception:
+            pass
+
+def server_time_ms() -> int:
+    """보정된 서버 기준 ms(추정치) 반환."""
+    return int(time.time() * 1000 + _SERVER_OFFSET_MS)
+
+def server_offset_ms() -> int:
+    """현재 보정 오프셋(ms) 조회(디버그용)."""
+    return _SERVER_OFFSET_MS
 
 # ---------- low-level utils ----------
 def _ts():
@@ -739,46 +789,34 @@ class BingXClient:
                     log(f"⚠️ set_leverage(alt,{s},{url}) failed: {e2}")
 
     # ----- Orders / Positions -----
-    
+
+
     def place_market(self, symbol: str, side: str, qty: float,
-                     reduce_only: bool=False, position_side: str|None=None,
-                     close_position: bool=False) -> str:
-        import math
+                    reduce_only: bool=False, position_side: str|None=None,
+                    close_position: bool=False) -> str:
         url = f"{BASE}/openApi/swap/v2/trade/order"
 
-        # === 정밀도/최소수량/스텝 보정 ===
-        pp, qp = self.get_symbol_filters(symbol)
-        step = 1.0 if qp == 0 else 10 ** (-qp)
+        # --- 수량 검증(그대로 사용) ---
         try:
-            spec = self.get_contract_spec(symbol)
-            min_qty = float(spec.get("tradeMinQuantity") or spec.get("minQty") or spec.get("minVol") or spec.get("minTradeNum") or 0.0)
-            step    = float(spec.get("qtyStep") or spec.get("volumeStep") or spec.get("stepSize") or step)
+            q = float(qty)
         except Exception:
-            min_qty = 0.0
-
-        qty = max(qty, 0.0)
-        qty = math.floor(qty / step) * step
-        qty = float(f"{qty:.{max(qp,0)}f}")
-        if qty < (min_qty or step):
-            qty = (min_qty or step)
-        if qty <= 0:
-            raise RuntimeError(f"quantity <= 0 after adjust (qp={qp}, min={min_qty}, step={step})")
+            raise RuntimeError("quantity must be a number")
+        if q <= 0:
+            raise RuntimeError("quantity must be > 0")
 
         base = {
             "symbol": symbol,
             "type": "MARKET",
             "side": side.upper(),
-            "quantity": qty,
+            "quantity": q,                # ← 들어온 값 그대로 사용
             "recvWindow": 60000,
             "timestamp": _ts(),
-            "clientOrderId": _make_cid("entry"),  # ⬅️ 변경
+            "clientOrderId": _make_cid("entry"),
         }
 
         if POSITION_MODE == "HEDGE":
-            # ✅ 항상 넣기 (기본값 LONG/SHORT)
-            ps = (position_side or ("LONG" if side.upper()=="BUY" else "SHORT")).upper()
+            ps = (position_side or ("LONG" if side.upper() == "BUY" else "SHORT")).upper()
             base["positionSide"] = ps
-            # HEDGE에서는 reduceOnly는 넣지 않는 편이 안전
         else:
             if reduce_only:
                 base["reduceOnly"] = True
@@ -787,56 +825,48 @@ class BingXClient:
         variants = []
         if close_position:
             v = dict(base)
-            v["closePosition"] = "true"   # ← 문자열
+            v["closePosition"] = "true"   # 문자열
             variants.append(v)
         variants.append(base)
 
         time.sleep(0.5)
-
         return self._try_order(url, variants)
+    
 
     def place_limit(self, symbol: str, side: str, qty: float, price: float,
                     reduce_only: bool=False, position_side: str|None=None,
                     tif: str="GTC", close_position: bool=False) -> str:
-        import math
         url = f"{BASE}/openApi/swap/v2/trade/order"
 
-        # === 정밀도/최소수량/스텝 보정 ===
-        pp, qp = self.get_symbol_filters(symbol)
-        step = 1.0 if qp == 0 else 10 ** (-qp)
+        # --- 간단 검증만 (보정 없음) ---
         try:
-            spec = self.get_contract_spec(symbol)
-            min_qty = float(spec.get("tradeMinQuantity") or spec.get("minQty") or spec.get("minVol") or spec.get("minTradeNum") or 0.0)
-            step    = float(spec.get("qtyStep") or spec.get("volumeStep") or spec.get("stepSize") or step)
+            q = float(qty)
         except Exception:
-            min_qty = 0.0
+            raise RuntimeError("quantity must be a number")
+        if q <= 0:
+            raise RuntimeError("quantity must be > 0 (limit)")
 
-        qty = max(qty, 0.0)
-        qty = math.floor(qty / step) * step
-        qty = float(f"{qty:.{max(qp,0)}f}")
-        if qty < (min_qty or step):
-            qty = (min_qty or step)
-        if qty <= 0:
-            raise RuntimeError(f"quantity <= 0 (limit) after adjust (qp={qp}, min={min_qty}, step={step})")
-
-        price = float(f"{float(price):.{max(pp,0)}f}")
-        if price <= 0:
-            raise RuntimeError("price <= 0 (limit)")
+        try:
+            p = float(price)
+        except Exception:
+            raise RuntimeError("price must be a number")
+        if p <= 0:
+            raise RuntimeError("price must be > 0 (limit)")
 
         base = {
             "symbol": symbol,
             "type": "LIMIT",
             "side": side.upper(),
-            "quantity": qty,
-            "price": price,
+            "quantity": q,
+            "price": p,
             "timeInForce": tif,
             "recvWindow": 60000,
             "timestamp": _ts(),
-            "clientOrderId": _make_cid("dca"),   # ★ DCA 태그 추가
+            "clientOrderId": _make_cid("dca"),
         }
 
         if POSITION_MODE == "HEDGE":
-            ps = (position_side or ("LONG" if side.upper()=="BUY" else "SHORT")).upper()
+            ps = (position_side or ("LONG" if side.upper() == "BUY" else "SHORT")).upper()
             base["positionSide"] = ps
         else:
             if reduce_only:
@@ -845,74 +875,47 @@ class BingXClient:
         variants = []
         if close_position:
             v = dict(base)
-            v["closePosition"] = "true"   # ← 문자열
+            v["closePosition"] = "true"   # 문자열
             variants.append(v)
         variants.append(base)
 
         time.sleep(0.5)
-
         return self._try_order(url, variants)
-    
+
+
     def place_tp_market(self, symbol: str,
                         side: str|None,                 # 포지션 반대 방향(없으면 position_side로 자동결정)
                         stop_price: float,              # 트리거 가격 (필수)
-                        qty: float|None=None,           # 수량 지정 (None이면 closePosition로 전체 청산)
+                        qty: float|None=None,           # ← 무시됨
                         position_side: str|None=None,   # HEDGE 모드에서 LONG/SHORT 지정
-                        close_position: bool=False      # True면 수량 대신 전체 청산
+                        close_position: bool=False      # ← 무시되고 항상 True 처리
                         ) -> str:
         """
         TAKE_PROFIT_MARKET 조건부 시장가 익절 주문.
-        - HEDGE 모드: positionSide 필수
-        - close_position=True면 quantity 없이 전체 청산 (closePosition="true")
+        항상 전체 청산(closePosition=true)으로만 전송합니다.
         """
-        import math, time
-        if qty is not None and float(qty) <= 0:
-            raise RuntimeError("skip TP: qty <= 0 (no position)")
-        
+        import time
+
+        # stop_price 간단 검증만 (정밀도/라운딩 없음)
+        try:
+            sp = float(stop_price)
+        except Exception:
+            raise RuntimeError("stop_price must be a number")
+        if sp <= 0:
+            raise RuntimeError("stop_price must be > 0 for TAKE_PROFIT_MARKET")
+
         url = f"{BASE}/openApi/swap/v2/trade/order"
 
-        # --- stopPrice 검증/보정 ---
-        if stop_price is None or float(stop_price) <= 0:
-            raise RuntimeError("stop_price must be > 0 for TAKE_PROFIT_MARKET")
-        pp, qp = self.get_symbol_filters(symbol)
-        stop_price = float(f"{float(stop_price):.{max(pp,0)}f}")
-
-        # --- 수량 보정(옵션) ---
-        adj_qty = None
-        if qty is not None and not close_position:
-            step = 1.0 if qp == 0 else 10 ** (-qp)
-            try:
-                spec = self.get_contract_spec(symbol)
-                min_qty = float(spec.get("tradeMinQuantity")
-                                or spec.get("minQty")
-                                or spec.get("minVol")
-                                or spec.get("minTradeNum")
-                                or 0.0)
-                step    = float(spec.get("qtyStep")
-                                or spec.get("volumeStep")
-                                or spec.get("stepSize")
-                                or step)
-            except Exception:
-                min_qty = 0.0
-
-            qty = max(float(qty), 0.0)
-            qty = math.floor(qty / step) * step
-            adj_qty = float(f"{qty:.{max(qp,0)}f}")
-            if adj_qty < (min_qty or step):
-                adj_qty = (min_qty or step)
-            if adj_qty <= 0:
-                raise RuntimeError(f"quantity <= 0 (tp_market) after adjust (qp={qp}, min={min_qty}, step={step})")
-
-        # --- side/positionSide 정리 ---
         base = {
             "symbol": symbol,
             "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": stop_price,
+            "stopPrice": sp,         # 들어온 값 그대로 사용
             "recvWindow": 60000,
             "timestamp": _ts(),
-            "clientOrderId": _make_cid("tp"),   # ★ TP 태그 추가 (원하면 "sl"도 구분 가능)
+            "clientOrderId": _make_cid("tp"),
         }
 
+        # side / positionSide 설정
         if POSITION_MODE == "HEDGE":
             ps = (position_side or "").upper()
             if not ps:
@@ -926,21 +929,14 @@ class BingXClient:
                 raise RuntimeError("ONE-WAY mode requires explicit side (BUY/SELL)")
             base["side"] = side.upper()
 
-        # --- quantity / closePosition 분기 ---
-        variants = []
-        if close_position:
-            v = dict(base)
-            v["closePosition"] = "true"   # 문자열
-            variants.append(v)
-        else:
-            if adj_qty is None:
-                raise RuntimeError("quantity is required unless close_position=True")
-            v = dict(base)
-            v["quantity"] = adj_qty
-            variants.append(v)
+        # 항상 전체 청산
+        v = dict(base)
+        v["closePosition"] = "true"   # quantity 미포함
+        variants = [v]
 
         time.sleep(0.5)
         return self._try_order(url, variants)
+
 
 
     def cancel_order(self, symbol: str, order_id: str) -> bool:
