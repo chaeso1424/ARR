@@ -112,12 +112,6 @@ USERS = {
 client = BingXClient()
 BOTS: dict[str, dict] = {}  # { bot_id: {"cfg": BotConfig, "state": BotState, "runner": BotRunner} }
 
-started = start_server_time_sync(interval_sec=600, jitter_sec=2)
-if started:
-    log("✅ started server time sync daemon (10m interval, jitter≤2s)")
-else:
-    log("ℹ️ server time sync daemon already running")
-    
 # ───────────────────────────────────────────────────────────────────────────────
 # 3-1) 경량 타이밍 유틸
 # ───────────────────────────────────────────────────────────────────────────────
