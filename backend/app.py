@@ -60,7 +60,7 @@ from utils.stats import get_stats, reset_stats, get_stats_window, get_profit_win
 from utils.logging import log
 from models.config import BotConfig
 from models.state import BotState
-from services.bingx_client import BingXClient, BASE, _req_get, _ts, start_server_time_sync, fetch_position_history_10m
+from services.bingx_client import BingXClient, BASE, _req_get, _ts, start_server_time_sync
 from bot.runner import BotRunner
 from flask_cors import CORS
 from utils.ids import safe_id
@@ -1039,14 +1039,6 @@ def login():
 
 
 
-#debug
-
-@app.get("/api/debug/poshist")
-def api_debug_poshist():
-    symbol = request.args.get("symbol", "BTC-USDT")
-    side = request.args.get("side")  # "LONG"/"SHORT" or None
-    data = fetch_position_history_10m(client, symbol, side)
-    return jsonify({"symbol": symbol, "side": side, "count": len(data), "items": data[:50]})
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 13) 엔트리포인트
