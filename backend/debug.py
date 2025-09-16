@@ -37,7 +37,7 @@ def demo():
         "recvWindow": "5000",
         # 심볼: 엔드포인트에 따라 BTC-USDT 또는 BTCUSDT를 씁니다.
         # 우선 문서 샘플처럼 하이픈 포함 형태 사용:
-        "positionId": "1967928225062670336",
+        "positionId": "1967943332299755520",
         "symbol": "BTC-USDT",
         "pageId": 0,
         "pageSize": 50,

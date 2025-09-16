@@ -7,6 +7,7 @@ import requests
 import uuid, json
 import datetime
 from typing import Optional
+import urllib.parse
 from urllib.parse import urlencode
 from utils.logging import log
 from requests.adapters import HTTPAdapter
@@ -190,6 +191,14 @@ def stop_server_time_sync(join_timeout: float | None = 1.0):
             pass
 
 # ---------- low-level utils ----------
+def _sort_qs_v1(params: dict) -> str:
+    # 키 정렬 + RFC3986 인코딩 (데모와 동일)
+    items = sorted((k, str(v)) for k, v in params.items() if v is not None)
+    return urllib.parse.urlencode(items, safe=":/", quote_via=urllib.parse.quote)
+
+def _sign_hex_str(secret: str, payload: str) -> str:
+    return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
 def _ts():
     """서버 오프셋 보정된 epoch(ms)"""
     return int(time.time() * 1000) + _SERVER_OFFSET_MS
@@ -1094,6 +1103,8 @@ class BingXClient:
         특정 positionId의 최근 10분 히스토리 조회 (v1: startTs/endTs 사용)
         - 심볼 표기는 v1 스펙에 맞춰 'BTC-USDT' 스타일을 그대로 사용
         """
+        url = f"{BASE}/openApi/swap/v1/trade/positionHistory"
+
         try:
             end_ms = int(time.time() * 1000)
             start_ms = end_ms - 60 * 60 * 1000
@@ -1106,9 +1117,10 @@ class BingXClient:
                 "pageId": 0,
                 "pageSize": 50,
                 "recvWindow": "6000",
+                "timestamp": int(time.time() * 1000),
             }
+            j = _req_get(url, {"symbol": symbol, "positionId": str(position_id), "startTs": start_ms, "endTs": end_ms, "recvWindow": 60000, "timestamp": _ts()}, signed=True)
 
-            j = _req_get(BASE + "/openApi/swap/v1/trade/positionHistory", params, signed=True)
             rows = j.get("data") or j.get("list") or j.get("rows") or []
             if not isinstance(rows, list):
                 return []
