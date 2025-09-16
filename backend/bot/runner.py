@@ -587,6 +587,7 @@ class BotRunner:
                                 base_price = float(self.client.get_last_price(self.cfg.symbol))
                             self._log(f"⚠️ avg_price=0 → fallback base_price={base_price} (DCA initial only)")
 
+                        #DCA
                         entry_pos_side = "LONG" if side == "BUY" else "SHORT"
                         cumulative = 0.0
                         self.state.open_limit_ids.clear()
