@@ -807,17 +807,6 @@ class BotRunner:
                                     if eff_entry <= 0:
                                         eff_entry = float(self.state.position_avg_price or 0.0) or float(mark)
 
-                                    # 최후 폴백: API가 비어 있으면 계산식
-                                    if pnl_api is None:
-                                        side_dir = self.cfg.side.upper()
-                                        contract_size = float(contract or 1.0)
-                                        if side_dir == "BUY":
-                                            pnl_api = (tp_price - eff_entry) * closed_qty * contract_size
-                                        else:
-                                            pnl_api = (eff_entry - tp_price) * closed_qty * contract_size
-                                        if abs(pnl_api) < 1e-10:
-                                            pnl_api = 0.0
-
                                     record_event(
                                         kind="TP",
                                         symbol=self.cfg.symbol,
