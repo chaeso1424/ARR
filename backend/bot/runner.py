@@ -827,7 +827,6 @@ class BotRunner:
                                         pnl=float(round(pnl_api, 10)),
                                         side=self.cfg.side.upper(),
                                         entry_price=eff_entry,
-                                        position_id=str(pos_id),
                                     )
                                     self._log(f"📈 TP 집계(positionHistory/positionId): pnl={pnl_api:.6f}, qty={qty_api or closed_qty}, price={tp_price}, pos_id={pos_id}, rows={len(rows)}")
                                     self._last_nonzero_qty = 0.0
