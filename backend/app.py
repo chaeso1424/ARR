@@ -65,6 +65,7 @@ from bot.runner import BotRunner
 from flask_cors import CORS
 from utils.ids import safe_id
 from utils.logging import log, get_logger
+from debug import fetch_position_history_10m
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 2) 경로/상수
@@ -1003,7 +1004,6 @@ def status_bot(bot_id):
     return jsonify(data)
 
 
-
 # ───────────────────────────────────────────────────────────────────────────────
 # 12) 디버그 & 로그인
 # ───────────────────────────────────────────────────────────────────────────────
@@ -1037,6 +1037,17 @@ def login():
         "exp": datetime.utcnow() + timedelta(hours=1)
     }, app.config['SECRET_KEY'], algorithm="HS256")
     return jsonify({"token": token})
+
+
+
+#debug
+
+@app.get("/api/debug/poshist")
+def api_debug_poshist():
+    symbol = request.args.get("symbol", "BTC-USDT")
+    side = request.args.get("side")  # "LONG"/"SHORT" or None
+    data = fetch_position_history_10m(client, symbol, side)
+    return jsonify({"symbol": symbol, "side": side, "count": len(data), "items": data[:50]})
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 13) 엔트리포인트
