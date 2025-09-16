@@ -1073,63 +1073,30 @@ class BingXClient:
     def get_position_history_exact(
         self,
         symbol: str,
-        position_id: str | int,
-        *,
-        side: str | None = None,   # "BUY"/"SELL" 또는 "LONG"/"SHORT"
-        page_index: int = 1,
-        page_size: int = 100,
-        recv_window: int = 60_000,
-    ) -> list[dict]:
+        position_id: str | int) -> list[dict]:
         """
         특정 positionId의 최근 10분 히스토리 조회 (v1: startTs/endTs 사용)
         - 심볼 표기는 v1 스펙에 맞춰 'BTC-USDT' 스타일을 그대로 사용
         """
         try:
-            now_ms   = _ts()                  # ms
-            start_ms = now_ms - 10 * 60_000   # 항상 10분
-            end_ms   = now_ms + 2_000         # 소폭 버퍼
-
-            page_id = max(int(page_index) - 1, 0)
-            page_sz = max(int(page_size), 1)
+            end_ms = int(time.time() * 1000)
+            start_ms = end_ms - 60 * 60 * 1000
 
             params = {
                 "symbol":        symbol,
                 "positionId":    str(position_id),
-                "startTs":       int(start_ms),
-                "endTs":         int(end_ms),
-                "pageId":        page_id,
-                "pageSize":      page_sz,
-                "recvWindow":    int(recv_window),
-                # timestamp/signature는 _req_get(..., signed=True)에서 부착
+                "startTs": start_ms,   # ← 반드시 startTs
+                "endTs": end_ms,       # ← 반드시 endTs
+                "pageId": 0,
+                "pageSize": 50,
+                "recvWindow": "6000",
+
             }
 
             j = _req_get(BASE + "/openApi/swap/v1/trade/positionHistory", params, signed=True)
             rows = j.get("data") or j.get("list") or j.get("rows") or []
             if not isinstance(rows, list):
                 return []
-
-            # 선택: 사이드 필터
-            if side:
-                side_u = str(side).upper()
-                if side_u in ("BUY", "LONG"):
-                    want = "LONG"
-                elif side_u in ("SELL", "SHORT"):
-                    want = "SHORT"
-                else:
-                    want = side_u
-                rows = [
-                    r for r in rows
-                    if str(r.get("positionSide") or r.get("posSide") or r.get("side") or "").upper() == want
-                ]
-
-            # 시간순 정렬(있는 키 중 하나 사용)
-            def _ts_of(r):
-                return (
-                    r.get("closeTime") or r.get("updateTime")
-                    or r.get("time") or r.get("timestamp")
-                    or r.get("openTime") or 0
-                )
-            rows.sort(key=_ts_of)
             return rows
 
         except Exception:

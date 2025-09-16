@@ -31,13 +31,13 @@ def demo():
 
     # 최근 10분 (밀리초)
     end_ms = int(time.time() * 1000)
-    start_ms = end_ms - 12 * 60 * 60 * 1000   # ← 최근 12시간
+    start_ms = end_ms - 60 * 60 * 1000
 
     params = {
         "recvWindow": "5000",
         # 심볼: 엔드포인트에 따라 BTC-USDT 또는 BTCUSDT를 씁니다.
         # 우선 문서 샘플처럼 하이픈 포함 형태 사용:
-        "positionId": "1967927060778405888",
+        "positionId": "1967928225062670336",
         "symbol": "BTC-USDT",
         "pageId": 0,
         "pageSize": 50,
