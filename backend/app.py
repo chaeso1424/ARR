@@ -15,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from redis_helper import get_redis
 from time import perf_counter
+from utils.ids import safe_id
+from utils.logging import log, get_logger
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 0) 스레드풀 / 전역 캐시
@@ -67,7 +69,6 @@ from flask_cors import CORS
 # 2) 경로/상수
 # ───────────────────────────────────────────────────────────────────────────────
 BOTS_DIR = BASE_DIR / "data" / "bots"
-BOTS_DIR.mkdir(parents=True, exist_ok=True)
 
 LOGS_DIR = BASE_DIR /"logs"              # backend/logs/{bot}.log
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -194,9 +195,6 @@ def token_required(f):
 # ───────────────────────────────────────────────────────────────────────────────
 # 5) 봇 설정 저장/로드 유틸
 # ───────────────────────────────────────────────────────────────────────────────
-def safe_bot_id(s: str) -> str:
-    """파일 경로 안전화"""
-    return re.sub(r"[^A-Za-z0-9._-]", "_", s)[:64]
 
 def bot_file(bot_id: str) -> Path:
     return BOTS_DIR / f"{bot_id}.json"
@@ -255,7 +253,11 @@ def get_or_create_bot(bot_id: str) -> dict:
     )
     state = BotState()
     state.repeat_mode = bool(data.get("repeat_mode", False))
-    runner = BotRunner(cfg, state, client, bot_id=bot_id)  # ← runner가 bot_id 받아서 각자 로그 파일 쓰게 구현 권장
+    runner = BotRunner(cfg, state, client, bot_id=bot_id)
+
+    # 예: 부팅 로그
+    get_logger(bot_id).info("bot instantiated with cfg=%s", data)
+
     BOTS[bot_id] = {"cfg": cfg, "state": state, "runner": runner}
     return BOTS[bot_id]
 
@@ -540,7 +542,7 @@ def _resolve_log_path(bot: str | None, file_key: str | None):
         p = FILE_MAP.get(str(file_key))
         return p if p else None
     if bot:
-        return LOGS_DIR / f"{safe_bot_id(bot)}.log"
+        return LOGS_DIR / f"{safe_id(bot)}.log"
     return DEFAULT_LOG_FILE
 
 @app.get("/api/logs")
@@ -804,7 +806,7 @@ def delete_bot(bot_id):
     if f.exists():
         f.unlink()
     # 로그 파일도 같이 제거하려면:
-    lf = LOGS_DIR / f"{safe_bot_id(bot_id)}.log"
+    lf = LOGS_DIR / f"{safe_id(bot_id)}.log"
     if lf.exists():
         lf.unlink()
     return jsonify({"ok": True})
