@@ -17,6 +17,8 @@ from redis_helper import get_redis
 from time import perf_counter
 from utils.ids import safe_id
 from utils.logging import log, get_logger
+from services.bingx_client import start_server_time_sync
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 0) 스레드풀 / 전역 캐시
@@ -110,6 +112,12 @@ USERS = {
 client = BingXClient()
 BOTS: dict[str, dict] = {}  # { bot_id: {"cfg": BotConfig, "state": BotState, "runner": BotRunner} }
 
+started = start_server_time_sync(interval_sec=600, jitter_sec=2)
+if started:
+    log("✅ started server time sync daemon (10m interval, jitter≤2s)")
+else:
+    log("ℹ️ server time sync daemon already running")
+    
 # ───────────────────────────────────────────────────────────────────────────────
 # 3-1) 경량 타이밍 유틸
 # ───────────────────────────────────────────────────────────────────────────────
@@ -264,7 +272,7 @@ get_or_create_bot(DEFAULT_BOT_ID)
 
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 6) 로그 tail 유틸 (A안: 파일 분리)
+# 6) 로그 tail 유틸 
 # ───────────────────────────────────────────────────────────────────────────────
 def _tail_log_lines(
     path: Path,
