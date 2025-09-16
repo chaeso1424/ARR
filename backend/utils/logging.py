@@ -26,6 +26,13 @@ def _make_file_handler(path: Path) -> RotatingFileHandler:
     )
     return handler
 
+class _EnsureBotSuffix(logging.Filter):
+    """record.bot_suffix 가 없으면 기본값 ''를 주입해서 포맷 에러를 방지."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "bot_suffix"):
+            record.bot_suffix = ""
+        return True
+
 def _ensure_root_logger() -> logging.Logger:
     global _root_logger
     if _root_logger:
@@ -42,6 +49,7 @@ def _ensure_root_logger() -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     base_handler.setFormatter(formatter)
+    base_handler.addFilter(_EnsureBotSuffix())   # ★ 필수: bot_suffix 기본값 주입
     logger.addHandler(base_handler)
 
     _root_logger = logger
@@ -52,12 +60,14 @@ def _get_or_create_bot_handler(bot_id: str) -> RotatingFileHandler:
         return _bot_file_handlers[bot_id]
     path = LOGS_DIR / f"{bot_id}.log"
     handler = _make_file_handler(path)
-    # 봇별 파일에는 동일 포맷
+    # 봇별 파일에는 bot_suffix 없어도 됨(이미 파일명이 봇별이므로)
     formatter = logging.Formatter(
         fmt="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     handler.setFormatter(formatter)
+    # 안전을 위해 여기에도 필터 넣어도 무방 (선택)
+    handler.addFilter(_EnsureBotSuffix())
     _bot_file_handlers[bot_id] = handler
     return handler
 
@@ -71,26 +81,23 @@ class BotLoggerAdapter(logging.LoggerAdapter):
         kwargs["extra"]["bot_suffix"] = suffix
         return msg, kwargs
 
-def get_logger(bot_id: str | None = None) -> logging.Logger:
+def get_logger(bot_id: str | None = None) -> logging.LoggerAdapter:
     """
-    - bot_id가 None: 기본 로거(arr) 반환 (logs.txt에 기록)
-    - bot_id가 존재: 기본 로거 + 봇별 파일 핸들러를 장착한 Adapter 반환
+    - bot_id가 None: 기본 로거에 대한 Adapter 반환 (logs.txt에 기록)
+    - bot_id가 존재: 기본 로거 + 봇별 파일 핸들러 장착한 Adapter 반환
     """
     root = _ensure_root_logger()
 
-    if not bot_id:
-        # 기본 로거 그대로
-        return root
+    if bot_id:
+        # 봇별 핸들러를 root logger에(한 번만) 추가
+        handler = _get_or_create_bot_handler(bot_id)
+        if handler not in root.handlers:
+            root.addHandler(handler)
 
-    # 봇별 핸들러를 root logger에(한 번만) 추가
-    handler = _get_or_create_bot_handler(bot_id)
-    if handler not in root.handlers:
-        # 같은 핸들러를 여러 번 붙이지 않게 주의
-        root.addHandler(handler)
-
+    # 항상 Adapter로 감싸서 bot_suffix를 보장
     return BotLoggerAdapter(root, {"bot_id": bot_id})
 
 # ---- 레거시 호환 함수 ----
 def log(msg: str, bot_id: str | None = None, level: int = logging.INFO):
-    logger = get_logger(bot_id)
+    logger = get_logger(bot_id)  # 항상 Adapter
     logger.log(level, msg)
