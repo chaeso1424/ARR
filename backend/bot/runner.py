@@ -797,16 +797,16 @@ class BotRunner:
                                     if not pos_id:
                                         raise RuntimeError("missing position_id for TP settlement")
 
-                                    MIN_BACK = int(os.getenv("TP_POSHIST_MIN_BACK_MIN", "10"))
-
-                                    pnl_api, qty_api, avg_close_price, rows = self.client.fetch_tp_realized_from_position_history_exact(
-                                        self.cfg.symbol,
-                                        position_id=pos_id,          # ★ 반드시 포함
+                                    # positionHistory 10분 조회
+                                    rows = self.client.get_position_history_exact(
+                                        symbol=self.cfg.symbol,
+                                        position_id=pos_id,
                                         side=self.cfg.side,
-                                        minutes_back=MIN_BACK,
                                     )
+                                    agg = self.client.aggregate_position_history(rows)
+                                    pnl_api = float(agg["position_profit"])
 
-                                    # qty/price 보강
+                                    # qty/price 보강 로직은 기존 코드 그대로
                                     if hasattr(self, "_last_nonzero_qty") and float(self._last_nonzero_qty) > 0:
                                         closed_qty = float(self._last_nonzero_qty)
                                     elif hasattr(self, "_prev_qty_snap") and float(self._prev_qty_snap) > 0:
@@ -815,31 +815,23 @@ class BotRunner:
                                         closed_qty = float(qty_now)
 
                                     tp_price = float(self._last_tp_price or 0.0) or float(mark)
-                                    if avg_close_price is not None:
-                                        tp_price = float(avg_close_price)
-
                                     eff_entry = float(entry_now or 0.0) if (entry_now and entry_now > 0) else float(last_entry or 0.0)
-                                    if eff_entry <= 0:
-                                        eff_entry = float(self.state.position_avg_price or 0.0) or float(mark)
 
                                     record_event(
                                         kind="TP",
                                         symbol=self.cfg.symbol,
-                                        price=float(tp_price),
-                                        qty=float(qty_api if (qty_api and qty_api > 0) else closed_qty),
+                                        price=tp_price,
+                                        qty=closed_qty,
                                         ts_ms=self._ts_ms(),
-                                        pnl=float(round(pnl_api, 10)),
+                                        pnl=round(pnl_api, 10),
                                         side=self.cfg.side.upper(),
                                         entry_price=eff_entry,
                                     )
-                                    self._log(f"📈 TP 집계(positionHistory/positionId): pnl={pnl_api:.6f}, qty={qty_api or closed_qty}, price={tp_price}, pos_id={pos_id}, rows={len(rows)}")
-                                    self._last_nonzero_qty = 0.0
+                                    self._log(f"📈 TP 집계: pnl={pnl_api:.6f}, pos_id={pos_id}, rows={len(rows)}")
 
                                 except Exception as _e:
                                     self._log(f"⚠️ TP 집계 실패(무시): {_e}")
-
                                 break
-
                                 
                             else:
                                 zero_streak = 0

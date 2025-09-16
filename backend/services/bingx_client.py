@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 from utils.logging import log
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from decimal import Decimal, InvalidOperation
 
 
 import os
@@ -1065,89 +1066,133 @@ class BingXClient:
         return entry, qty
 
 
-    # pnl
+    # ─────────────────────────────────────────────────────────
+    # Position History (최근 10분 고정) → 행 그대로 반환
+    # GET /openApi/swap/v1/trade/positionHistory
+    # ─────────────────────────────────────────────────────────
     def get_position_history_exact(
         self,
         symbol: str,
         position_id: str | int,
         *,
-        minutes_back: int = 10,
-        side: str | None = None,      # "BUY"/"SELL" → LONG/SHORT 추가 필터(선택)
+        side: str | None = None,   # "BUY"/"SELL" 또는 "LONG"/"SHORT"
         page_index: int = 1,
         page_size: int = 100,
-        recv_window: int = 60000,
+        recv_window: int = 60_000,
     ) -> list[dict]:
         """
-        GET /openApi/swap/v1/trade/positionHistory (signed)
-        - 특정 positionId 의 10분 내 히스토리를 정확히 조회
+        특정 positionId의 최근 10분 히스토리 조회 (v1: startTs/endTs 사용)
+        - 심볼 표기는 v1 스펙에 맞춰 'BTC-USDT' 스타일을 그대로 사용
         """
-        now_ms   = _ts()
-        start_ms = now_ms - minutes_back * 60_000
-        end_ms   = now_ms + 2_000  # 소폭 버퍼
+        try:
+            now_ms   = _ts()                  # ms
+            start_ms = now_ms - 10 * 60_000   # 항상 10분
+            end_ms   = now_ms + 2_000         # 소폭 버퍼
 
-        params = {
-            "symbol": symbol,                # required
-            "timestamp": now_ms,             # required (ms)
-            "startTs": start_ms,             # required (ms)
-            "endTs": end_ms,                 # required (ms)
-            "positionId": str(position_id),
-            "pageIndex": int(page_index),
-            "pageSize": int(page_size),
-            "recvWindow": int(recv_window),
-        }
-        j = _req_get(BASE + "/openApi/swap/v1/trade/positionHistory", params, signed=True)
-        rows = j.get("data") or j.get("list") or j.get("rows") or []
-        if not isinstance(rows, list):
+            page_id = max(int(page_index) - 1, 0)
+            page_sz = max(int(page_size), 1)
+
+            params = {
+                "symbol":        symbol,
+                "positionId":    str(position_id),
+                "startTs":       int(start_ms),
+                "endTs":         int(end_ms),
+                "pageId":        page_id,
+                "pageSize":      page_sz,
+                "recvWindow":    int(recv_window),
+                # timestamp/signature는 _req_get(..., signed=True)에서 부착
+            }
+
+            j = _req_get(BASE + "/openApi/swap/v1/trade/positionHistory", params, signed=True)
+            rows = j.get("data") or j.get("list") or j.get("rows") or []
+            if not isinstance(rows, list):
+                return []
+
+            # 선택: 사이드 필터
+            if side:
+                side_u = str(side).upper()
+                if side_u in ("BUY", "LONG"):
+                    want = "LONG"
+                elif side_u in ("SELL", "SHORT"):
+                    want = "SHORT"
+                else:
+                    want = side_u
+                rows = [
+                    r for r in rows
+                    if str(r.get("positionSide") or r.get("posSide") or r.get("side") or "").upper() == want
+                ]
+
+            # 시간순 정렬(있는 키 중 하나 사용)
+            def _ts_of(r):
+                return (
+                    r.get("closeTime") or r.get("updateTime")
+                    or r.get("time") or r.get("timestamp")
+                    or r.get("openTime") or 0
+                )
+            rows.sort(key=_ts_of)
+            return rows
+
+        except Exception:
             return []
 
-        if side:
-            want = "LONG" if str(side).upper() == "BUY" else "SHORT"
-            rows = [r for r in rows
-                    if str(r.get("positionSide") or r.get("posSide") or r.get("side") or "").upper() == want]
-        return rows
+    # ─────────────────────────────────────────────────────────
+    # rows 집계 → realisedProfit, positionCommission, totalFunding 합산
+    # position_profit = realised - commission - funding
+    # ─────────────────────────────────────────────────────────
+    @staticmethod
+    def _D(x):
+        try:
+            if x is None: return Decimal("0")
+            if isinstance(x, Decimal): return x
+            return Decimal(str(x))
+        except (InvalidOperation, ValueError, TypeError):
+            return Decimal("0")
 
-    def aggregate_position_history(self, rows: list[dict]) -> tuple[float | None, float, float | None]:
-        """
-        positionHistory 행들에서 realisedProfit 합, closePositionAmt 합, avgClosePrice 가중 평균.
-        반환: (pnl or None, qty_sum, avg_close_price or None)
-        """
-        pnl_sum, pnl_seen = 0.0, False
-        qty_sum, notional = 0.0, 0.0
+    @classmethod
+    def aggregate_position_history(cls, rows: list[dict]) -> dict:
+        realised   = Decimal("0")
+        commission = Decimal("0")
+        funding    = Decimal("0")
 
-        for r in rows:
-            rp = (r.get("realisedProfit") or r.get("realizedProfit")
-                  or r.get("realisedPnl") or r.get("realizedPnl"))
-            if rp not in (None, ""):
-                try:
-                    pnl_sum += float(rp); pnl_seen = True
-                except: pass
+        for r in rows or []:
+            realised   += cls._D(r.get("realisedProfit"))
+            commission += cls._D(r.get("positionCommission"))
+            funding    += cls._D(r.get("totalFunding"))
 
-            q = r.get("closePositionAmt") or r.get("closeAmt") or r.get("closeQuantity")
-            p = r.get("avgClosePrice")    or r.get("closePrice") or r.get("avgPrice")
-            try: fq = abs(float(q)) if q not in (None, "") else 0.0
-            except: fq = 0.0
-            try: fp = float(p) if p not in (None, "") else None
-            except: fp = None
+        position_profit = realised - commission - funding
+        return {
+            "realisedProfit": float(reali := realised),
+            "positionCommission": float(commission),
+            "totalFunding": float(funding),
+            "position_profit": float(position_profit),
+            "_raw_decimal": {
+                "realisedProfit": str(reali),
+                "positionCommission": str(commission),
+                "totalFunding": str(funding),
+                "position_profit": str(position_profit),
+            }
+        }
 
-            qty_sum += fq
-            if fp is not None and fq > 0: notional += fq * fp
-
-        avg_close = (notional / qty_sum) if qty_sum > 0 else None
-        return (pnl_sum if pnl_seen else None), qty_sum, avg_close
-
-    def fetch_tp_realized_from_position_history_exact(
+    # ─────────────────────────────────────────────────────────
+    # 편의 메서드: 최근 10분 profit 집계만 바로 받고 싶을 때
+    # (저장은 러너/서비스 레이어에서 처리 권장)
+    # ─────────────────────────────────────────────────────────
+    def get_position_profit_10m(
         self,
         symbol: str,
         position_id: str | int,
         *,
-        side: str | None,
-        minutes_back: int = 10,
-    ) -> tuple[float | None, float, float | None, list[dict]]:
-        """
-        positionId 를 반드시 포함해 그 포지션의 realisedProfit만 집계.
-        """
+        side: str | None = None,
+        page_index: int = 1,
+        page_size: int = 100,
+        recv_window: int = 60_000,
+    ) -> dict:
         rows = self.get_position_history_exact(
-            symbol, position_id, minutes_back=minutes_back, side=side
+            symbol=symbol,
+            position_id=position_id,
+            side=side,
+            page_index=page_index,
+            page_size=page_size,
+            recv_window=recv_window,
         )
-        pnl, qty, avg_close = self.aggregate_position_history(rows)
-        return pnl, qty, avg_close, rows
+        return self.aggregate_position_history(rows)
