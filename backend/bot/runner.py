@@ -15,7 +15,7 @@ from redis_helper import get_redis
 import os
 
 # ===== 운영 파라미터 =====
-RESTART_DELAY_SEC = int(os.getenv("RESTART_DELAY_SEC", "60"))   # TP 후 다음 사이클 대기
+RESTART_DELAY_SEC = int(os.getenv("RESTART_DELAY_SEC", "55"))   # TP 후 다음 사이클 대기
 CLOSE_ZERO_STREAK = int(os.getenv("CLOSE_ZERO_STREAK", "3"))    # 종료 판정에 필요한 연속 0회수
 ZERO_EPS_FACTOR   = float(os.getenv("ZERO_EPS_FACTOR", "0.5"))  # 0 판정 여유(최소단위의 50%)
 POLL_SEC          = 1.5
@@ -777,6 +777,21 @@ class BotRunner:
                                 chk_avg, chk_qty = 0.0, 0.0
 
                             if float(chk_qty or 0.0) < zero_eps:
+
+                                if not did_cleanup:
+                                    self._cancel_tracked_limits()
+                                    if self.state.tp_order_id:
+                                        try:
+                                            self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
+                                        except Exception:
+                                            pass
+                                        self.state.tp_order_id = None
+                                    self.state.reset_orders()
+                                    did_cleanup = True
+
+                                self._log("✅ 포지션 종료 확정(연속검증+이중확인) → 대기")
+
+                                time.sleep(5)
                                 try:
                                     pos_id = getattr(self.state, "tp_position_id", None) or getattr(self.state, "last_position_id", None)
                                     if not pos_id:
@@ -823,19 +838,9 @@ class BotRunner:
                                 except Exception as _e:
                                     self._log(f"⚠️ TP 집계 실패(무시): {_e}")
 
-                                if not did_cleanup:
-                                    self._cancel_tracked_limits()
-                                    if self.state.tp_order_id:
-                                        try:
-                                            self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
-                                        except Exception:
-                                            pass
-                                        self.state.tp_order_id = None
-                                    self.state.reset_orders()
-                                    did_cleanup = True
-
-                                self._log("✅ 포지션 종료 확정(연속검증+이중확인) → 대기")
                                 break
+
+                                
                             else:
                                 zero_streak = 0
 
