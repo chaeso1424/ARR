@@ -266,22 +266,75 @@ get_or_create_bot(DEFAULT_BOT_ID)
 # ───────────────────────────────────────────────────────────────────────────────
 # 6) 로그 tail 유틸 (A안: 파일 분리)
 # ───────────────────────────────────────────────────────────────────────────────
-def _tail_log_lines(path: Path, tail: int, grep: str | None = None, level: str | None = None, strip_ansi: bool = True):
-    tail = max(1, min(int(tail or 500), 5000))
-    lines = deque(maxlen=tail)
+def _tail_log_lines(
+    path: Path,
+    tail: int,
+    grep: str | None = None,
+    level: str | None = None,
+    strip_ansi: bool = True,
+    *,
+    _chunk_size: int = 64 * 1024,   # 내부 튜닝용: 역방향 읽기 블록 크기
+    _max_bytes: int | None = None   # 내부 튜닝용: 최대 읽기 바이트(예: 10*1024*1024)
+):
+    """
+    기존 API를 유지하면서 파일 끝에서부터 역방향 chunk로 읽어 마지막 N줄만 반환.
+    - tail: 반환할 줄 수(필터 적용 후), [1, 5000] 사이로 클램프
+    - grep/level: 부분 문자열 포함 필터(케이스 무시)
+    - strip_ansi: ANSI 시퀀스 제거
+    """
+    n = max(1, min(int(tail or 500), 5000))
+    grep_l = grep.lower() if grep else None
+    level_l = level.lower() if level else None
+
     try:
-        with path.open("r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if strip_ansi:
-                    line = ANSI_RE.sub("", line)
-                if grep and grep.lower() not in line.lower():
-                    continue
-                if level and (level.lower() not in line.lower()):
-                    continue
-                lines.append(line.rstrip("\n"))
+        fsize = path.stat().st_size
     except FileNotFoundError:
         return []
-    return list(lines)
+
+    if fsize == 0:
+        return []
+
+    buf = bytearray()
+    read_total = 0
+
+    with path.open("rb") as f:
+        pos = fsize
+        # 파일 끝에서 앞으로(_chunk_size씩) 이동하며 누적
+        while pos > 0 and (_max_bytes is None or read_total < _max_bytes):
+            read_len = min(_chunk_size, pos)
+            pos -= read_len
+            f.seek(pos, os.SEEK_SET)
+            chunk = f.read(read_len)
+            # 앞쪽에 붙여 역순 누적 (파일의 뒤→앞 순서로 확장)
+            buf[:0] = chunk
+            read_total += read_len
+
+            # 충분히 모였으면 한 번 디코드/필터 후 줄 수 확인
+            if len(buf) > _chunk_size or pos == 0:
+                lines = _decode_and_filter(buf, grep_l, level_l, strip_ansi)
+                if len(lines) >= n or pos == 0:
+                    return lines[-n:]
+
+    # 안전장치로 이곳에 왔다면 최종 한 번 더 처리
+    lines = _decode_and_filter(buf, grep_l, level_l, strip_ansi)
+    return lines[-n:]
+
+
+def _decode_and_filter(buf: bytearray, grep_l: str | None, level_l: str | None, strip_ansi: bool):
+    """bytes → str 디코드 후 ANSI 제거/grep/level 필터 적용."""
+    text = buf.decode("utf-8", errors="ignore")
+    raw_lines = text.splitlines()
+
+    out = []
+    for line in raw_lines:
+        s = ANSI_RE.sub("", line) if strip_ansi else line
+        l = s.lower()
+        if grep_l and grep_l not in l:
+            continue
+        if level_l and level_l not in l:
+            continue
+        out.append(s)
+    return out
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 7) 주별 잔고 시리즈 (캐시 즉시 응답 + 백그라운드 갱신 + 프리워밍)
