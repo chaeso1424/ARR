@@ -814,10 +814,12 @@ class BotRunner:
                                                 )
                                             except Exception:
                                                 pos_id = None
-                                                self._log("pos_id 미존재")  
 
                                     if not pos_id:
                                         raise RuntimeError("missing position_id for TP settlement")
+                                    
+                                    self._log(pos_id)
+                                    self._log(self.cfg.symbol)
 
                                     # 3-3) positionHistory 조회(체결 반영 지연 대비 3회까지 짧게 재시도)
                                     rows = []

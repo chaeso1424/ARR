@@ -1099,14 +1099,13 @@ class BingXClient:
             start_ms = end_ms - 60 * 60 * 1000
 
             params = {
-                "symbol":        symbol,
-                "positionId":    str(position_id),
-                "startTs": start_ms,   # ← 반드시 startTs
-                "endTs": end_ms,       # ← 반드시 endTs
+                "symbol": symbol,
+                "positionId": str(position_id),
+                "startTs": start_ms,
+                "endTs": end_ms,
                 "pageId": 0,
                 "pageSize": 50,
                 "recvWindow": "6000",
-
             }
 
             j = _req_get(BASE + "/openApi/swap/v1/trade/positionHistory", params, signed=True)
