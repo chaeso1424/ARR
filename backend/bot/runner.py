@@ -709,14 +709,15 @@ class BotRunner:
                         zero_eps = min_allowed * ZERO_EPS_FACTOR
                         inc = qty_now_for_dca - prev_qty_snap
 
-                        # [A] 포지션 살아있는 동안 최신 positionId → state.last_position_id 로 복사
+                        # [PID capture] 포지션이 살아있는 동안 최신 positionId를 붙잡아 둔다
                         try:
                             pid_cache = getattr(self.client, "_last_position_id", {}).get(
                                 (self.cfg.symbol, self.cfg.side.upper())
                             )
                             if pid_cache and qty_now_for_dca >= zero_eps:
-                                if getattr(self.state, "last_position_id", None) != pid_cache:
-                                    self.state.last_position_id = pid_cache
+                                # 다음 단계에서 쓸 수 있도록 두 곳 모두 갱신
+                                self.state.last_position_id = pid_cache
+                                self.state.tp_position_id = pid_cache
                         except Exception:
                             pass
 
@@ -793,28 +794,53 @@ class BotRunner:
                                 self._log(self._last_position_id)
                                 
 
-                                time.sleep(5)
                                 # --- TP 집계 (positionHistory v1) ---
                                 try:
+                                    # 3-1) pos_id 확보(폴백 포함)
                                     pos_id = getattr(self.state, "tp_position_id", None) or getattr(self.state, "last_position_id", None)
+
+                                    if not pos_id:
+                                        # 내부 캐시 갱신 시도(실패해도 무시)
+                                        try:
+                                            _ = self.client.position_info(self.cfg.symbol, self.cfg.side)
+                                        except Exception:
+                                            pass
+                                        # 클라이언트에 recent pid 헬퍼가 있다면 사용(없어도 무방)
+                                        if hasattr(self.client, "get_recent_position_id"):
+                                            pos_id = self.client.get_recent_position_id(self.cfg.symbol, self.cfg.side, max_age_ms=120_000)
+                                        # 마지막 폴백: 내부 dict 직접 조회
+                                        if not pos_id:
+                                            try:
+                                                pos_id = getattr(self.client, "_last_position_id", {}).get(
+                                                    (self.cfg.symbol, self.cfg.side.upper())
+                                                )
+                                            except Exception:
+                                                pos_id = None
+
                                     if not pos_id:
                                         raise RuntimeError("missing position_id for TP settlement")
 
-                                    # ▶ v1 심볼로 변환 (예: BTCUSDT -> BTC-USDT). 이미 '-' 있으면 그대로 사용.
+                                    # 3-2) v1 심볼 변환
                                     sym_v1 = self.cfg.symbol
                                     if "-" not in sym_v1:
                                         if sym_v1.endswith("USDT"):
                                             sym_v1 = f"{sym_v1[:-4]}-USDT"
 
-                                    # 1) 최근 10분 positionHistory rows
-                                    rows = self.client.get_position_history_exact(
-                                        symbol=sym_v1,            # ← 변환된 v1 심볼 사용
-                                        position_id=pos_id,
-                                    )
+                                    # 3-3) positionHistory 조회(체결 반영 지연 대비 3회까지 짧게 재시도)
+                                    rows = []
+                                    for _ in range(3):
+                                        rows = self.client.get_position_history_exact(
+                                            symbol=sym_v1,
+                                            position_id=pos_id,
+                                        )
+                                        if rows:
+                                            break
+                                        time.sleep(1.0)  # 1초 대기 후 재시도
+
                                     if not rows:
                                         raise RuntimeError("no positionHistory rows")
 
-                                    # 2) 합계: realisedProfit - positionCommission - totalFunding
+                                    # 3-4) 합계: realisedProfit - positionCommission - totalFunding
                                     agg = self.client.aggregate_position_history(rows)
                                     pnl_api = float(agg["position_profit"])
 
@@ -918,15 +944,13 @@ class BotRunner:
                                 if tp_equal_price is not None:
                                     self._last_tp_price = tp_equal_price
 
-
-                                #pnl 계산용 pos_id
+                                # ★ pid도 같이 확보(체결 직전 0으로 사라지는 문제 대비)
                                 try:
                                     pid_cache = getattr(self.client, "_last_position_id", {}).get(
                                         (self.cfg.symbol, self.cfg.side.upper())
                                     )
                                 except Exception:
                                     pid_cache = None
-                                # 캐시에 없으면 직전에 저장해둔 last_position_id를 폴백
                                 self.state.tp_position_id = pid_cache or getattr(self.state, "last_position_id", None)
 
                                 self._log(f"ℹ️ 기존 TP 채택: id={tp_equal_id}")

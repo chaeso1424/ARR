@@ -70,6 +70,10 @@ _TIME_SYNC_STOP = threading.Event()
 MAX_RETRIES = int(os.getenv("BINGX_MAX_RETRIES", "3"))
 RETRY_DELAY = float(os.getenv("BINGX_RETRY_DELAY", "30"))
 
+def _now_ms():
+    import time as _t
+    return int(_t.time() * 1000)
+
 def _should_retry(err: Exception) -> bool:
     s = str(err).lower()
     hints = (
@@ -980,7 +984,7 @@ class BingXClient:
                 log(f"⚠️ open_orders: {e}")
             return []
 
-
+    
     def position_info(self, symbol: str, side: str) -> tuple[float, float]:
         """
         Return current position (entry/avg price, quantity). If no position exists,
@@ -996,6 +1000,8 @@ class BingXClient:
             self._last_position = {}
         if not hasattr(self, "_last_position_id"):
             self._last_position_id = {}
+        if not hasattr(self, "_last_position_id_ts"):
+            self._last_position_id_ts = {}
 
         # 네트워크 실패 시 기존 (entry, qty) 캐시 반환
         def _from_cache():
@@ -1024,8 +1030,7 @@ class BingXClient:
         if not pos:
             # 포지션 없음: 두 캐시 갱신
             self._last_position[cache_key] = (0.0, 0.0)
-            self._last_position_id[cache_key] = None
-            return 0.0, 0.0
+            return 0.0, 0.0 
 
         # entry (avg price)
         entry = 0.0
@@ -1051,7 +1056,6 @@ class BingXClient:
                 except:
                     pass
 
-        # ★ positionId 파싱 (문자열로 저장)
         pid = None
         for k in ("positionId", "id", "position_id"):
             v = pos.get(k)
@@ -1059,12 +1063,24 @@ class BingXClient:
                 pid = str(v)
                 break
 
-        # 캐시 갱신
-        self._last_position[cache_key] = (entry, qty)   # ← 2-튜플 유지!
-        self._last_position_id[cache_key] = pid         # ← 별도 캐시에 보관
-
+        self._last_position[cache_key] = (entry, qty)
+        if pid:
+            self._last_position_id[cache_key] = pid
+            self._last_position_id_ts[cache_key] = _now_ms()
         return entry, qty
-
+    
+    def get_recent_position_id(self, symbol: str, side: str, max_age_ms: int = 120_000) -> str | None:
+        """
+        포지션이 0이 된 뒤에도 '최근 max_age_ms 이내'에 본 positionId가 있으면 반환
+        """
+        if not hasattr(self, "_last_position_id") or not hasattr(self, "_last_position_id_ts"):
+            return None
+        key = (str(symbol), str(side).upper())
+        pid = self._last_position_id.get(key)
+        ts  = self._last_position_id_ts.get(key, 0)
+        if pid and (_now_ms() - ts) <= max_age_ms:
+            return pid
+        return None
 
     # ─────────────────────────────────────────────────────────
     # Position History (최근 10분 고정) → 행 그대로 반환
@@ -1163,3 +1179,4 @@ class BingXClient:
             recv_window=recv_window,
         )
         return self.aggregate_position_history(rows)
+    
