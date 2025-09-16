@@ -183,6 +183,9 @@ def stop_server_time_sync(join_timeout: float | None = 1.0):
             t.join(join_timeout)
         except Exception:
             pass
+#빼세요@@ 디버그
+def norm_symbol(s: str) -> str:
+    return s.replace('-', '')
 
 # ---------- low-level utils ----------
 def _ts():
@@ -1151,10 +1154,7 @@ class BingXClient:
         )
         pnl, qty, avg_close = self.aggregate_position_history(rows)
         return pnl, qty, avg_close, rows
-    
-        
-    def norm_symbol(s: str) -> str:
-        return s.replace('-', '')
+
 
     def fetch_position_history_10m(client, symbol: str, position_side: str | None = None):
         sym = norm_symbol(symbol)
