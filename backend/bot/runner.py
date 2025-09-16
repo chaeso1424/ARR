@@ -709,6 +709,17 @@ class BotRunner:
                         zero_eps = min_allowed * ZERO_EPS_FACTOR
                         inc = qty_now_for_dca - prev_qty_snap
 
+                        # [A] 포지션 살아있는 동안 최신 positionId → state.last_position_id 로 복사
+                        try:
+                            pid_cache = getattr(self.client, "_last_position_id", {}).get(
+                                (self.cfg.symbol, self.cfg.side.upper())
+                            )
+                            if pid_cache and qty_now_for_dca >= zero_eps:
+                                if getattr(self.state, "last_position_id", None) != pid_cache:
+                                    self.state.last_position_id = pid_cache
+                        except Exception:
+                            pass
+
                         if qty_now_for_dca > 0:
                             self._last_nonzero_qty = qty_now_for_dca
 
@@ -767,6 +778,20 @@ class BotRunner:
 
                             if float(chk_qty or 0.0) < zero_eps:
                                 try:
+                                    pos_id = getattr(self.state, "tp_position_id", None) or getattr(self.state, "last_position_id", None)
+                                    if not pos_id:
+                                        raise RuntimeError("missing position_id for TP settlement")
+
+                                    MIN_BACK = int(os.getenv("TP_POSHIST_MIN_BACK_MIN", "10"))
+
+                                    pnl_api, qty_api, avg_close_price, rows = self.client.fetch_tp_realized_from_position_history_exact(
+                                        self.cfg.symbol,
+                                        position_id=pos_id,          # ★ 반드시 포함
+                                        side=self.cfg.side,
+                                        minutes_back=MIN_BACK,
+                                    )
+
+                                    # qty/price 보강
                                     if hasattr(self, "_last_nonzero_qty") and float(self._last_nonzero_qty) > 0:
                                         closed_qty = float(self._last_nonzero_qty)
                                     elif hasattr(self, "_prev_qty_snap") and float(self._prev_qty_snap) > 0:
@@ -775,32 +800,38 @@ class BotRunner:
                                         closed_qty = float(qty_now)
 
                                     tp_price = float(self._last_tp_price or 0.0) or float(mark)
+                                    if avg_close_price is not None:
+                                        tp_price = float(avg_close_price)
 
                                     eff_entry = float(entry_now or 0.0) if (entry_now and entry_now > 0) else float(last_entry or 0.0)
                                     if eff_entry <= 0:
                                         eff_entry = float(self.state.position_avg_price or 0.0) or float(mark)
 
-                                    side_dir = self.cfg.side.upper()
-                                    contract_size = float(contract or 1.0)
-                                    if side_dir == "BUY":
-                                        pnl = (tp_price - eff_entry) * closed_qty * contract_size
-                                    else:
-                                        pnl = (eff_entry - tp_price) * closed_qty * contract_size
-                                    if abs(pnl) < 1e-10:
-                                        pnl = 0.0
+                                    # 최후 폴백: API가 비어 있으면 계산식
+                                    if pnl_api is None:
+                                        side_dir = self.cfg.side.upper()
+                                        contract_size = float(contract or 1.0)
+                                        if side_dir == "BUY":
+                                            pnl_api = (tp_price - eff_entry) * closed_qty * contract_size
+                                        else:
+                                            pnl_api = (eff_entry - tp_price) * closed_qty * contract_size
+                                        if abs(pnl_api) < 1e-10:
+                                            pnl_api = 0.0
 
                                     record_event(
                                         kind="TP",
                                         symbol=self.cfg.symbol,
-                                        price=tp_price,
-                                        qty=closed_qty,
+                                        price=float(tp_price),
+                                        qty=float(qty_api if (qty_api and qty_api > 0) else closed_qty),
                                         ts_ms=self._ts_ms(),
-                                        pnl=pnl,
-                                        side=side_dir,
-                                        entry_price=eff_entry
+                                        pnl=float(round(pnl_api, 10)),
+                                        side=self.cfg.side.upper(),
+                                        entry_price=eff_entry,
+                                        position_id=str(pos_id),
                                     )
-                                    self._log(f"📈 TP 집계: price={tp_price}, qty={closed_qty}, pnl={pnl:.6f}")
+                                    self._log(f"📈 TP 집계(positionHistory/positionId): pnl={pnl_api:.6f}, qty={qty_api or closed_qty}, price={tp_price}, pos_id={pos_id}, rows={len(rows)}")
                                     self._last_nonzero_qty = 0.0
+
                                 except Exception as _e:
                                     self._log(f"⚠️ TP 집계 실패(무시): {_e}")
 
@@ -859,6 +890,18 @@ class BotRunner:
                                 self.state.tp_order_id = tp_equal_id
                                 if tp_equal_price is not None:
                                     self._last_tp_price = tp_equal_price
+
+
+                                #pnl 계산용 pos_id
+                                try:
+                                    pid_cache = getattr(self.client, "_last_position_id", {}).get(
+                                        (self.cfg.symbol, self.cfg.side.upper())
+                                    )
+                                except Exception:
+                                    pid_cache = None
+                                # 캐시에 없으면 직전에 저장해둔 last_position_id를 폴백
+                                self.state.tp_position_id = pid_cache or getattr(self.state, "last_position_id", None)
+
                                 self._log(f"ℹ️ 기존 TP 채택: id={tp_equal_id}")
                             continue
 
@@ -925,6 +968,7 @@ class BotRunner:
                             last_tp_reset_ts = now_ts
                             self._log(f"♻️ TP 재설정(MKT): id={new_id}, stop={new_stop}, qty={new_qty}")
 
+
                     # 루프 탈출: repeat면 다시 반복
                     if self._stop:
                         pass
@@ -950,6 +994,7 @@ class BotRunner:
                                 time.sleep(1)
                         if not self._stop:
                             self._log(" 재시작")
+                            
 
                 except Exception as e:
                     # 🔁 여기서만 자기치유. 재귀 호출 금지.

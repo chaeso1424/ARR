@@ -985,18 +985,28 @@ class BingXClient:
         Return current position (entry/avg price, quantity). If no position exists,
         returns (0.0, 0.0). Uses a sticky cache to avoid returning zero erroneously
         on transient network/API failures.
+        NOTE: positionId도 함께 파싱해 내부 캐시에 저장하지만, 반환값은 (entry, qty)로 유지합니다.
         """
         url = f"{BASE}/openApi/swap/v2/user/positions"
         cache_key = (str(symbol), str(side).upper())
+
+        # 내부 캐시 초기화(최초 1회)
+        if not hasattr(self, "_last_position"):
+            self._last_position = {}
+        if not hasattr(self, "_last_position_id"):
+            self._last_position_id = {}
+
+        # 네트워크 실패 시 기존 (entry, qty) 캐시 반환
+        def _from_cache():
+            return self._last_position.get(cache_key, (0.0, 0.0))
+
         try:
             j = _req_get(url, {"symbol": symbol, "recvWindow": 60000, "timestamp": _ts()}, signed=True)
         except Exception as e:
-            # Transient failure: return cached position if available
-            try:
-                log(f"⚠️ position_info failed: {e}")
-            except Exception:
-                pass
-            return self._last_position.get(cache_key, (0.0, 0.0))
+            try: log(f"⚠️ position_info failed: {e}")
+            except Exception: pass
+            return _from_cache()
+
         arr = j.get("data", [])
         want = "LONG" if str(side).upper() == "BUY" else "SHORT"
         pos = None
@@ -1009,34 +1019,135 @@ class BingXClient:
             else:
                 pos = p
                 break
+
         if not pos:
-            # Update cache to reflect no position
+            # 포지션 없음: 두 캐시 갱신
             self._last_position[cache_key] = (0.0, 0.0)
+            self._last_position_id[cache_key] = None
             return 0.0, 0.0
-        # Determine entry (avg price)
-        entry_keys = ["entryPrice", "avgPrice", "avgEntryPrice", "openPrice", "positionOpenPrice"]
+
+        # entry (avg price)
         entry = 0.0
-        for k in entry_keys:
+        for k in ("entryPrice", "avgPrice", "avgEntryPrice", "openPrice", "positionOpenPrice"):
             v = pos.get(k)
             if v not in (None, ""):
                 try:
                     entry = float(v)
                     if entry > 0:
                         break
-                except Exception:
+                except:
                     pass
-        # Determine quantity (absolute value)
-        qty_keys = ["positionAmt", "positionAmount", "quantity", "positionQty", "positionSize", "amount", "qty"]
+
+        # qty (absolute)
         qty = 0.0
-        for k in qty_keys:
+        for k in ("positionAmt", "positionAmount", "quantity", "positionQty", "positionSize", "amount", "qty"):
             v = pos.get(k)
             if v not in (None, ""):
                 try:
                     qty = abs(float(v))
                     if qty > 0:
                         break
-                except Exception:
+                except:
                     pass
-        # Update cache and return
-        self._last_position[cache_key] = (entry, qty)
+
+        # ★ positionId 파싱 (문자열로 저장)
+        pid = None
+        for k in ("positionId", "id", "position_id"):
+            v = pos.get(k)
+            if v not in (None, ""):
+                pid = str(v)
+                break
+
+        # 캐시 갱신
+        self._last_position[cache_key] = (entry, qty)   # ← 2-튜플 유지!
+        self._last_position_id[cache_key] = pid         # ← 별도 캐시에 보관
+
         return entry, qty
+
+
+    # pnl
+    def get_position_history_exact(
+        self,
+        symbol: str,
+        position_id: str | int,
+        *,
+        minutes_back: int = 10,
+        side: str | None = None,      # "BUY"/"SELL" → LONG/SHORT 추가 필터(선택)
+        page_index: int = 1,
+        page_size: int = 100,
+        recv_window: int = 60000,
+    ) -> list[dict]:
+        """
+        GET /openApi/swap/v1/trade/positionHistory (signed)
+        - 특정 positionId 의 10분 내 히스토리를 정확히 조회
+        """
+        now_ms   = _ts()
+        start_ms = now_ms - minutes_back * 60_000
+        end_ms   = now_ms + 2_000  # 소폭 버퍼
+
+        params = {
+            "symbol": symbol,                # required
+            "timestamp": now_ms,             # required (ms)
+            "startTs": start_ms,             # required (ms)
+            "endTs": end_ms,                 # required (ms)
+            "positionId": str(position_id),
+            "pageIndex": int(page_index),
+            "pageSize": int(page_size),
+            "recvWindow": int(recv_window),
+        }
+        j = _req_get(BASE + "/openApi/swap/v1/trade/positionHistory", params, signed=True)
+        rows = j.get("data") or j.get("list") or j.get("rows") or []
+        if not isinstance(rows, list):
+            return []
+
+        if side:
+            want = "LONG" if str(side).upper() == "BUY" else "SHORT"
+            rows = [r for r in rows
+                    if str(r.get("positionSide") or r.get("posSide") or r.get("side") or "").upper() == want]
+        return rows
+
+    def aggregate_position_history(self, rows: list[dict]) -> tuple[float | None, float, float | None]:
+        """
+        positionHistory 행들에서 realisedProfit 합, closePositionAmt 합, avgClosePrice 가중 평균.
+        반환: (pnl or None, qty_sum, avg_close_price or None)
+        """
+        pnl_sum, pnl_seen = 0.0, False
+        qty_sum, notional = 0.0, 0.0
+
+        for r in rows:
+            rp = (r.get("realisedProfit") or r.get("realizedProfit")
+                  or r.get("realisedPnl") or r.get("realizedPnl"))
+            if rp not in (None, ""):
+                try:
+                    pnl_sum += float(rp); pnl_seen = True
+                except: pass
+
+            q = r.get("closePositionAmt") or r.get("closeAmt") or r.get("closeQuantity")
+            p = r.get("avgClosePrice")    or r.get("closePrice") or r.get("avgPrice")
+            try: fq = abs(float(q)) if q not in (None, "") else 0.0
+            except: fq = 0.0
+            try: fp = float(p) if p not in (None, "") else None
+            except: fp = None
+
+            qty_sum += fq
+            if fp is not None and fq > 0: notional += fq * fp
+
+        avg_close = (notional / qty_sum) if qty_sum > 0 else None
+        return (pnl_sum if pnl_seen else None), qty_sum, avg_close
+
+    def fetch_tp_realized_from_position_history_exact(
+        self,
+        symbol: str,
+        position_id: str | int,
+        *,
+        side: str | None,
+        minutes_back: int = 10,
+    ) -> tuple[float | None, float, float | None, list[dict]]:
+        """
+        positionId 를 반드시 포함해 그 포지션의 realisedProfit만 집계.
+        """
+        rows = self.get_position_history_exact(
+            symbol, position_id, minutes_back=minutes_back, side=side
+        )
+        pnl, qty, avg_close = self.aggregate_position_history(rows)
+        return pnl, qty, avg_close, rows
