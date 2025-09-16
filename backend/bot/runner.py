@@ -821,36 +821,44 @@ class BotRunner:
 
                         want_side = "SELL" if side == "BUY" else "BUY"
                         want_pos  = "LONG" if side == "BUY" else "SHORT"
+
                         tp_equal_exists = False
                         tp_equal_id = None
                         tp_equal_price = None
+
+                        def _truthy(v):
+                            if isinstance(v, bool):
+                                return v
+                            if v is None:
+                                return False
+                            s = str(v).strip().lower()
+                            return s in ("1", "true", "t", "yes", "y", "on")
+
                         for o in open_orders:
                             o_side = str(o.get("side") or o.get("orderSide") or "").upper()
                             o_pos  = str(o.get("positionSide") or o.get("posSide") or o.get("position_side") or "").upper()
                             if (o_side != want_side) or (o_pos != want_pos):
                                 continue
-                            q = o.get("origQty") or o.get("quantity") or o.get("qty") or o.get("orig_quantity")
+
+                            reduce_only = _truthy(o.get("reduceOnly") or o.get("reduce_only"))
+                            if not reduce_only:
+                                continue
+
+                            tp_equal_exists = True
+                            tp_equal_id = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
+                            p = o.get("price") or o.get("origPrice") or o.get("limitPrice")
                             try:
-                                oq = float(q) if q is not None else 0.0
+                                tp_equal_price = float(p) if p is not None else None
                             except Exception:
-                                oq = 0.0
-                            if abs(qty_now - oq) < float(step or 1.0):
-                                tp_equal_exists = True
-                                tp_equal_id = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
-                                p = o.get("price") or o.get("origPrice") or o.get("limitPrice")
-                                try:
-                                    tp_equal_price = float(p) if p is not None else None
-                                except Exception:
-                                    tp_equal_price = None
-                                break
+                                tp_equal_price = None
+                            break
 
                         if tp_equal_exists:
                             if not tp_alive:
                                 self.state.tp_order_id = tp_equal_id
                                 if tp_equal_price is not None:
                                     self._last_tp_price = tp_equal_price
-                                self._last_tp_qty = qty_now
-                                self._log(f"ℹ️ 기존 TP 채택: id={tp_equal_id}, qty≈{qty_now}")
+                                self._log(f"ℹ️ 기존 TP 채택: id={tp_equal_id}")
                             continue
 
                         need_reset_tp = False

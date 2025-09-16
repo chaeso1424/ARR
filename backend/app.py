@@ -255,8 +255,6 @@ def get_or_create_bot(bot_id: str) -> dict:
     state.repeat_mode = bool(data.get("repeat_mode", False))
     runner = BotRunner(cfg, state, client, bot_id=bot_id)
 
-    # 예: 부팅 로그
-    get_logger(bot_id).info("bot instantiated with cfg=%s", data)
 
     BOTS[bot_id] = {"cfg": cfg, "state": state, "runner": runner}
     return BOTS[bot_id]
