@@ -12,6 +12,7 @@ from utils.logging import log
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+
 import os
 # --- force IPv4 only for urllib3/requests ---
 import socket
@@ -58,6 +59,7 @@ _SERVER_TIME_PATHS = [
 ]
 
 # 동기화 스레드 관리용 전역
+_SERVER_OFFSET_MS = 0
 _TIME_SYNC_LOCK = threading.Lock()
 _TIME_SYNC_THREAD: Optional[threading.Thread] = None
 _TIME_SYNC_STOP = threading.Event()
@@ -125,16 +127,26 @@ def _sync_server_time_once():
         pass
     return False
 
+def server_time_ms() -> int:
+    return int(time.time() * 1000 + _SERVER_OFFSET_MS)
+
+def server_offset_ms() -> int:
+    return _SERVER_OFFSET_MS
+
+def _sync_server_time_once() -> bool:
+    """
+    기존에 쓰던 구현 유지. 실패 시 예외 던지지 말고 False 반환 + log만.
+    - 내부에서 BASE, _session, TIMEOUT, _SERVER_OFFSET_MS 사용
+    """
+    # ← 당신이 기존에 쓰던 안전한 버전(예외 삼킴) 그대로 두세요.
+    ...
+
 def start_server_time_sync(interval_sec: int = 600, jitter_sec: int = 0) -> bool:
-    """
-    서버 시간 동기화 데몬을 시작. 이미 실행 중이면 아무 것도 하지 않고 False 반환.
-    interval_sec: 주기(초). 기본 600초(10분).
-    jitter_sec:   최초 시작 지터(0~jitter_sec 랜덤 대기)로 동시다발 호출 완화.
-    """
+    """이미 실행 중이면 False, 새로 시작하면 True 반환."""
     global _TIME_SYNC_THREAD
     with _TIME_SYNC_LOCK:
         if _TIME_SYNC_THREAD and _TIME_SYNC_THREAD.is_alive():
-            return False  # 이미 실행 중
+            return False
 
         _TIME_SYNC_STOP.clear()
 
@@ -152,24 +164,17 @@ def start_server_time_sync(interval_sec: int = 600, jitter_sec: int = 0) -> bool
                         except Exception:
                             pass
             finally:
-                # 종료 시 포인터 정리
+                # 스레드 종료 시 포인터 정리
                 with _TIME_SYNC_LOCK:
-                    # 현재 스레드가 우리가 추적하던 스레드면 None으로 리셋
                     if threading.current_thread() is _TIME_SYNC_THREAD:
                         _TIME_SYNC_THREAD = None
 
-        t = threading.Thread(
-            target=_loop,
-            name="bingx-time-sync",
-            daemon=True,
-        )
+        t = threading.Thread(target=_loop, name="bingx-time-sync", daemon=True)
         t.start()
         _TIME_SYNC_THREAD = t
         return True
 
 def stop_server_time_sync(join_timeout: float | None = 1.0):
-    """동기화 데몬 중지. 이미 중지 상태여도 안전."""
-    global _TIME_SYNC_THREAD
     _TIME_SYNC_STOP.set()
     with _TIME_SYNC_LOCK:
         t = _TIME_SYNC_THREAD
@@ -178,14 +183,6 @@ def stop_server_time_sync(join_timeout: float | None = 1.0):
             t.join(join_timeout)
         except Exception:
             pass
-
-def server_time_ms() -> int:
-    """보정된 서버 기준 ms(추정치) 반환."""
-    return int(time.time() * 1000 + _SERVER_OFFSET_MS)
-
-def server_offset_ms() -> int:
-    """현재 보정 오프셋(ms) 조회(디버그용)."""
-    return _SERVER_OFFSET_MS
 
 # ---------- low-level utils ----------
 def _ts():

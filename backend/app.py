@@ -112,6 +112,19 @@ USERS = {
 client = BingXClient()
 BOTS: dict[str, dict] = {}  # { bot_id: {"cfg": BotConfig, "state": BotState, "runner": BotRunner} }
 
+try:
+    _started_sync = start_server_time_sync(interval_sec=600, jitter_sec=2)
+    if _started_sync:
+        log("✅ started server time sync daemon (interval=600s, jitter≤2s)")
+    else:
+        log("ℹ️ server time sync daemon already running in this process")
+except Exception as e:
+    # 어떤 이유로든 여기서 죽지 않도록 보호
+    try:
+        log(f"⚠️ failed to start time-sync daemon: {e}")
+    except Exception:
+        pass
+
 # ───────────────────────────────────────────────────────────────────────────────
 # 3-1) 경량 타이밍 유틸
 # ───────────────────────────────────────────────────────────────────────────────
