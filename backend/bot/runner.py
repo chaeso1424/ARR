@@ -814,21 +814,16 @@ class BotRunner:
                                                 )
                                             except Exception:
                                                 pos_id = None
+                                                self._log("pos_id 미존재")  
 
                                     if not pos_id:
                                         raise RuntimeError("missing position_id for TP settlement")
-
-                                    # 3-2) v1 심볼 변환
-                                    sym_v1 = self.cfg.symbol
-                                    if "-" not in sym_v1:
-                                        if sym_v1.endswith("USDT"):
-                                            sym_v1 = f"{sym_v1[:-4]}-USDT"
 
                                     # 3-3) positionHistory 조회(체결 반영 지연 대비 3회까지 짧게 재시도)
                                     rows = []
                                     for _ in range(3):
                                         rows = self.client.get_position_history_exact(
-                                            symbol=sym_v1,
+                                            symbol=self.cfg.symbol,
                                             position_id=pos_id,
                                         )
                                         if rows:
@@ -890,8 +885,7 @@ class BotRunner:
                                     self._log(
                                         "📈 TP 집계(v1 posHistory): pnl=%.6f, qty=%s, price=%s, pos_id=%s, rows=%d, realised=%.6f, commission=%.6f, funding=%.6f, sym_v1=%s",
                                         pnl_api, final_qty, tp_price, pos_id, len(rows),
-                                        agg.get("realisedProfit", 0.0), agg.get("positionCommission", 0.0), agg.get("totalFunding", 0.0),
-                                        sym_v1
+                                        agg.get("realisedProfit", 0.0), agg.get("positionCommission", 0.0), agg.get("totalFunding", 0.0)
                                     )
                                     self._last_nonzero_qty = 0.0
 
