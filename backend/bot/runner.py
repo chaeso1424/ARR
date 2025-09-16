@@ -792,21 +792,49 @@ class BotRunner:
                                 self._log("✅ 포지션 종료 확정(연속검증+이중확인) → 대기")
 
                                 time.sleep(5)
+                                # --- TP 집계 (positionHistory v1) ---
                                 try:
                                     pos_id = getattr(self.state, "tp_position_id", None) or getattr(self.state, "last_position_id", None)
                                     if not pos_id:
                                         raise RuntimeError("missing position_id for TP settlement")
 
-                                    # positionHistory 10분 조회
+                                    # 1) 최근 10분 positionHistory rows
                                     rows = self.client.get_position_history_exact(
                                         symbol=self.cfg.symbol,
                                         position_id=pos_id,
                                         side=self.cfg.side,
+                                        page_index=1,
+                                        page_size=100,
                                     )
+                                    if not rows:
+                                        raise RuntimeError("no positionHistory rows")
+
+                                    # 2) 합계: realisedProfit - positionCommission - totalFunding
                                     agg = self.client.aggregate_position_history(rows)
                                     pnl_api = float(agg["position_profit"])
 
-                                    # qty/price 보강 로직은 기존 코드 그대로
+                                    # 3) 수량/평단 계산 (rows 기반 보강)
+                                    def _f(x, default=0.0):
+                                        try:
+                                            return float(x)
+                                        except Exception:
+                                            return default
+
+                                    # closePositionAmt가 여러 행이면 절댓값 합산
+                                    qty_api_sum = sum(abs(_f(r.get("closePositionAmt"))) for r in rows if r.get("closePositionAmt") is not None)
+                                    qty_api = qty_api_sum if qty_api_sum > 0 else None
+
+                                    # 가중 평균 종가(있으면 사용): sum(price*qty)/sum(qty)
+                                    w_num, w_den = 0.0, 0.0
+                                    for r in rows:
+                                        q = abs(_f(r.get("closePositionAmt")))
+                                        p = r.get("avgClosePrice")
+                                        if p is not None and q > 0:
+                                            w_num += _f(p) * q
+                                            w_den += q
+                                    avg_close_price = (w_num / w_den) if w_den > 0 else None
+
+                                    # 4) 기존 로직과 합치기 (qty/price 보강)
                                     if hasattr(self, "_last_nonzero_qty") and float(self._last_nonzero_qty) > 0:
                                         closed_qty = float(self._last_nonzero_qty)
                                     elif hasattr(self, "_prev_qty_snap") and float(self._prev_qty_snap) > 0:
@@ -815,22 +843,39 @@ class BotRunner:
                                         closed_qty = float(qty_now)
 
                                     tp_price = float(self._last_tp_price or 0.0) or float(mark)
-                                    eff_entry = float(entry_now or 0.0) if (entry_now and entry_now > 0) else float(last_entry or 0.0)
+                                    if avg_close_price is not None:
+                                        tp_price = float(avg_close_price)
 
+                                    eff_entry = float(entry_now or 0.0) if (entry_now and entry_now > 0) else float(last_entry or 0.0)
+                                    if eff_entry <= 0:
+                                        eff_entry = float(self.state.position_avg_price or 0.0) or float(mark)
+
+                                    # qty_api가 있으면 우선 사용, 없으면 closed_qty 사용
+                                    final_qty = float(qty_api) if (qty_api and qty_api > 0) else float(closed_qty)
+
+                                    # 5) 이벤트 기록 (pnl=position_profit)
                                     record_event(
                                         kind="TP",
                                         symbol=self.cfg.symbol,
-                                        price=tp_price,
-                                        qty=closed_qty,
+                                        price=float(tp_price),
+                                        qty=final_qty,
                                         ts_ms=self._ts_ms(),
-                                        pnl=round(pnl_api, 10),
+                                        pnl=float(round(pnl_api, 10)),
                                         side=self.cfg.side.upper(),
                                         entry_price=eff_entry,
                                     )
-                                    self._log(f"📈 TP 집계: pnl={pnl_api:.6f}, pos_id={pos_id}, rows={len(rows)}")
+
+                                    # 로그: 세부내역도 함께
+                                    self._log(
+                                        "📈 TP 집계(positionHistory/positionId): pnl=%.6f, qty=%s, price=%s, pos_id=%s, rows=%d, realised=%.6f, commission=%.6f, funding=%.6f",
+                                        pnl_api, final_qty, tp_price, pos_id, len(rows),
+                                        agg.get("realisedProfit", 0.0), agg.get("positionCommission", 0.0), agg.get("totalFunding", 0.0)
+                                    )
+                                    self._last_nonzero_qty = 0.0
 
                                 except Exception as _e:
                                     self._log(f"⚠️ TP 집계 실패(무시): {_e}")
+
                                 break
                                 
                             else:
