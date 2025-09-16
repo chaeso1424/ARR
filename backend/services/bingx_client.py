@@ -1099,27 +1099,22 @@ class BingXClient:
         self,
         symbol: str,
         position_id: str | int) -> list[dict]:
-        """
-        특정 positionId의 최근 10분 히스토리 조회 (v1: startTs/endTs 사용)
-        - 심볼 표기는 v1 스펙에 맞춰 'BTC-USDT' 스타일을 그대로 사용
-        """
+
         url = f"{BASE}/openApi/swap/v1/trade/positionHistory"
 
         try:
             end_ms = int(time.time() * 1000)
             start_ms = end_ms - 60 * 60 * 1000
 
-            params = {
-                "symbol": symbol,
-                "positionId": str(position_id),
-                "startTs": start_ms,
-                "endTs": end_ms,
+            j = _req_get(url, {
+                "symbol": symbol, 
+                "positionId": str(position_id), 
+                "startTs": start_ms, 
+                "endTs": end_ms, 
                 "pageId": 0,
-                "pageSize": 50,
-                "recvWindow": "6000",
-                "timestamp": int(time.time() * 1000),
-            }
-            j = _req_get(url, {"symbol": symbol, "positionId": str(position_id), "startTs": start_ms, "endTs": end_ms, "recvWindow": 60000, "timestamp": _ts()}, signed=True)
+                "pageSize": 50
+                },
+                signed=True)
 
             rows = j.get("data") or j.get("list") or j.get("rows") or []
             if not isinstance(rows, list):
