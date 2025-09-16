@@ -790,9 +790,7 @@ class BotRunner:
                                     self.state.reset_orders()
                                     did_cleanup = True
 
-                                self._log("✅ 포지션 종료 확정(연속검증+이중확인) → 대기")
-                                self._log(self._last_position_id)
-                                
+                                self._log("✅ 포지션 종료 확정(연속검증+이중확인) → 대기")                                
 
                                 # --- TP 집계 (positionHistory v1) ---
                                 try:
