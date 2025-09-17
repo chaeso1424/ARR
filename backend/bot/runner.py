@@ -709,6 +709,8 @@ class BotRunner:
                         min_allowed = max(float(min_qty or 0.0), float(step or 0.0))
                         zero_eps = min_allowed * ZERO_EPS_FACTOR
                         inc = qty_now_for_dca - prev_qty_snap
+                        dca_happened = (inc is not None) and (inc > zero_eps)
+
 
                         # [PID capture] 포지션이 살아있는 동안 최신 positionId를 붙잡아 둔다
                         try:
@@ -886,22 +888,23 @@ class BotRunner:
                             break
 
                         if tp_equal_exists:
-                            if not tp_alive:
-                                self.state.tp_order_id = tp_equal_id
-                                if tp_equal_price is not None:
-                                    self._last_tp_price = tp_equal_price
+                            # 기존 TP가 있으므로 '살아있음'으로 간주하고 상태만 동기화
+                            tp_alive = True
+                            self.state.tp_order_id = tp_equal_id
+                            if tp_equal_price is not None:
+                                self._last_tp_price = tp_equal_price
+                            # 평단도 캐시(아래 need_reset_tp에서 eff_entry와 비교 안정화)
+                            self._last_entry = float(entry_now or 0.0)
 
-                                # ★ pid도 같이 확보(체결 직전 0으로 사라지는 문제 대비)
-                                try:
-                                    pid_cache = getattr(self.client, "_last_position_id", {}).get(
-                                        (self.cfg.symbol, self.cfg.side.upper())
-                                    )
-                                except Exception:
-                                    pid_cache = None
-                                self.state.tp_position_id = pid_cache or getattr(self.state, "last_position_id", None)
+                            try:
+                                pid_cache = getattr(self.client, "_last_position_id", {}).get(
+                                    (self.cfg.symbol, self.cfg.side.upper())
+                                )
+                            except Exception:
+                                pid_cache = None
+                            self.state.tp_position_id = pid_cache or getattr(self.state, "last_position_id", None)
 
-                                self._log(f"ℹ️ 기존 TP 채택: id={tp_equal_id}")
-                            continue
+                            self._log(f"ℹ️ 기존 TP 채택: id={tp_equal_id}")
 
                         need_reset_tp = False
                         eff_entry = entry_now if entry_now > 0 else float(last_entry or 0.0)
@@ -910,10 +913,15 @@ class BotRunner:
                         else:
                             if qty_now >= min_allowed and eff_entry > 0:
                                 ideal_stop = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
+
+                                # 1) 캐시 미존재면 일단 리셋
                                 if (last_entry is None) or (last_tp_price is None):
                                     need_reset_tp = True
-                                elif (abs(eff_entry - last_entry) >= 2 * tick) or \
-                                    (abs(ideal_stop - last_tp_price) >= 2 * tick):
+                                # 2) 가격이 유의미하게 달라지면 리셋
+                                elif (abs(eff_entry - last_entry) >= 2 * tick) or (abs(ideal_stop - last_tp_price) >= 2 * tick):
+                                    need_reset_tp = True
+                                # 3) ★ DCA(수량 증가) 발생 시 강제 리셋 (ALL-TP는 수량 비교 대신 증가 이벤트로 판단)
+                                elif dca_happened:
                                     need_reset_tp = True
 
                         if need_reset_tp:
@@ -955,12 +963,14 @@ class BotRunner:
                                     raise
 
                             self.state.tp_order_id = str(new_id)
-                            last_entry     = eff_entry
-                            last_tp_price  = new_stop
-                            self._last_entry = eff_entry
+
+                            last_entry    = eff_entry
+                            last_tp_price = new_stop
+                            self._last_entry    = eff_entry
                             self._last_tp_price = new_stop
+
                             last_tp_reset_ts = now_ts
-                            self._log(f"♻️ TP 재설정(MKT): id={new_id}, stop={new_stop}, qty={new_qty}")
+                            self._log(f"♻️ TP 재설정(MKT): id={new_id}, stop={new_stop}")
 
 
                     # 루프 탈출: repeat면 다시 반복
