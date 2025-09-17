@@ -449,6 +449,8 @@ class BotRunner:
                     min_live_qty = max(float(min_qty or 0.0), float(step or 0.0))
                     attach_mode = (float(pre_qty) >= (min_live_qty * ZERO_EPS_FACTOR))
                     self._attach_mode = attach_mode
+                    self._tp_detect_enabled = bool(attach_mode)
+                    self._tp_seen = getattr(self, "_tp_seen", (None, None))
 
                     # 0) 가용 USDT 체크 (attach 모드면 패스 가능)
                     try:
@@ -884,14 +886,13 @@ class BotRunner:
                             # (id, stopPrice) 형태로 마지막으로 확인된 TP 상태를 기억
                             self._tp_seen = (None, None)
 
-                        if tp_equal_exists:
-                            # tracked id가 죽어있으면 adopt
+                        if tp_equal_exists and self._tp_detect_enabled:
+                            # tp_alive가 아니면 adopt (tracked id 업데이트)
                             if not tp_alive:
                                 self.state.tp_order_id = tp_equal_id
 
-                            # --- stopPrice(또는 triggerPrice) 읽기 ---
-                            cur_stop = tp_equal_price  # 위에서 p를 stopPrice 우선으로 채웠다면 이 값이 곧 stopPrice
-                            # 안전하게 한 번 더 보정 (혹시 위에서 못 읽었을 경우 대비)
+                            # stopPrice 우선 취득
+                            cur_stop = tp_equal_price
                             if cur_stop is None:
                                 try:
                                     for o in open_orders:
@@ -909,19 +910,23 @@ class BotRunner:
                             except Exception:
                                 cur_stop_f = None
 
-                            # === 스냅샷과 비교: 바뀌었을 때만 갱신/로그 ===
-                            prev_id, prev_stop = self._tp_seen
+                            # 스냅샷 비교: 바뀌었을 때만 로그
+                            prev_id, prev_stop = (self._tp_seen if hasattr(self, "_tp_seen") else (None, None))
                             cur_id = self.state.tp_order_id or tp_equal_id
 
-                            if (cur_id != prev_id) or (cur_stop_f is not None and prev_stop is not None and abs(cur_stop_f - prev_stop) >= (10 ** (-pp))):
-                                # 상태 갱신
+                            changed = (cur_id != prev_id) or (
+                                cur_stop_f is not None and prev_stop is not None and abs(cur_stop_f - prev_stop) >= (10 ** (-pp))
+                            )
+
+                            if changed:
                                 self._tp_seen = (cur_id, cur_stop_f)
-                                # 내부 기준값도 업데이트 (리셋 판정에서 사용)
                                 if cur_stop_f is not None:
                                     last_tp_price = cur_stop_f
                                     self._last_tp_price = cur_stop_f
-                                # ‘변경되었을 때만’ 로그
                                 self._log(f"ℹ️ 기존 TP 감지/갱신: id={cur_id}, stopPrice={cur_stop_f}")
+
+                            # ★ 원샷: 어태치 모드에서 기존 TP를 확인/채택했으니 더는 감지/로그 하지 않음
+                            self._tp_detect_enabled = False
 
                         # ===== need_reset_tp 계산부 교체 =====
 
