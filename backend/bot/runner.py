@@ -821,6 +821,7 @@ class BotRunner:
                                     self._log(f"pos_id={pos_id}, symbol={self.cfg.symbol}")
 
                                     # 2) vi_api를 통해 netProfit 단일 조회
+                                    time.sleep(2)
                                     pnl_api = get_position_net_profit(self.cfg.symbol, pos_id)
 
                                     if pnl_api is None:
@@ -887,15 +888,12 @@ class BotRunner:
                                 tp_equal_price = None
                             break
 
+                        # 기존 TP 존재 → '살아있음' 표시만 하고, 채택은 리셋판단 이후로 지연
                         if tp_equal_exists:
-                            # 기존 TP가 있으므로 '살아있음'으로 간주하고 상태만 동기화
                             tp_alive = True
-                            self.state.tp_order_id = tp_equal_id
                             if tp_equal_price is not None:
                                 self._last_tp_price = tp_equal_price
-                            # 평단도 캐시(아래 need_reset_tp에서 eff_entry와 비교 안정화)
-                            self._last_entry = float(entry_now or 0.0)
-
+                            # pid 캐시는 미리 잡아두되, 여기선 채택/continue 하지 않음
                             try:
                                 pid_cache = getattr(self.client, "_last_position_id", {}).get(
                                     (self.cfg.symbol, self.cfg.side.upper())
@@ -903,24 +901,26 @@ class BotRunner:
                             except Exception:
                                 pid_cache = None
                             self.state.tp_position_id = pid_cache or getattr(self.state, "last_position_id", None)
+                        
 
-                            self._log(f"ℹ️ 기존 TP 채택: id={tp_equal_id}")
+                        dca_happened = (inc is not None) and (inc > zero_eps)
 
                         need_reset_tp = False
                         eff_entry = entry_now if entry_now > 0 else float(last_entry or 0.0)
+
                         if not tp_alive:
                             need_reset_tp = (qty_now >= min_allowed and eff_entry > 0)
                         else:
                             if qty_now >= min_allowed and eff_entry > 0:
                                 ideal_stop = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
 
-                                # 1) 캐시 미존재면 일단 리셋
+                                # 가격 캐시 없으면 리셋
                                 if (last_entry is None) or (last_tp_price is None):
                                     need_reset_tp = True
-                                # 2) 가격이 유의미하게 달라지면 리셋
+                                # 가격 차이 나면 리셋
                                 elif (abs(eff_entry - last_entry) >= 2 * tick) or (abs(ideal_stop - last_tp_price) >= 2 * tick):
                                     need_reset_tp = True
-                                # 3) ★ DCA(수량 증가) 발생 시 강제 리셋 (ALL-TP는 수량 비교 대신 증가 이벤트로 판단)
+                                # DCA 증가 이벤트 시에는 강제로 리셋 (평단 변화가 미미해도)
                                 elif dca_happened:
                                     need_reset_tp = True
 
@@ -972,6 +972,13 @@ class BotRunner:
                             last_tp_reset_ts = now_ts
                             self._log(f"♻️ TP 재설정(MKT): id={new_id}, stop={new_stop}")
 
+                        else:
+                            if tp_equal_exists:
+                                if getattr(self, "_last_tp_adopt_id", None) != tp_equal_id:
+                                    self.state.tp_order_id = tp_equal_id
+                                    self._last_entry = float(entry_now or 0.0)
+                                    self._last_tp_adopt_id = tp_equal_id   # ⬅️ 중복 채택 로그 방지용 가드
+                                    self._log(f"ℹ️ 기존 TP 채택: id={tp_equal_id}")
 
                     # 루프 탈출: repeat면 다시 반복
                     if self._stop:
