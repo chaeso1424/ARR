@@ -500,7 +500,6 @@ class BotRunner:
                             self._prev_qty_snap = 0.0
                         last_entry = float(pre_avg or 0.0)
                         last_tp_price = self._last_tp_price
-                        last_tp_qty = self._last_tp_qty
                     else:
                         entry_side = "BUY" if side == "BUY" else "SELL"
                         entry_pos  = "LONG" if side == "BUY" else "SHORT"
@@ -897,17 +896,32 @@ class BotRunner:
                             continue
 
                         need_reset_tp = False
+
+                        # 수량 변화(증가/감소 모두) 감지: 거래소 수량 스텝 기반으로 허용오차 설정
+                        qty_step = float(step or 1.0)
+                        qty_tol  = max(qty_step * 0.5, 1e-12)  # 반 스텝 이상 변하면 '변화'로 간주
+                        qty_changed = abs(inc) >= qty_tol      # inc는 위에서 계산된 (현재qty - 이전스냅샷)
+
                         eff_entry = entry_now if entry_now > 0 else float(last_entry or 0.0)
-                        if not tp_alive:
-                            need_reset_tp = (qty_now >= min_allowed and eff_entry > 0)
-                        else:
-                            if qty_now >= min_allowed and eff_entry > 0:
-                                ideal_stop = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
+
+                        if (qty_now >= min_allowed) and (eff_entry > 0):
+                            # 1) TP가 없으면 재설정
+                            if not tp_alive:
+                                need_reset_tp = True
+                            # 2) 포지션 수량이 변했으면 재설정 (핵심 조건)
+                            elif qty_changed:
+                                need_reset_tp = True
+                            else:
+                                # 3) 보조 조건: 진입가/이상적 TP가 이전 기록과 '틱' 이상 달라졌으면 재설정
+                                ideal_stop = tp_price_from_roi(
+                                    eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp
+                                )
                                 if (last_entry is None) or (last_tp_price is None):
                                     need_reset_tp = True
-                                elif (abs(eff_entry - last_entry) >= tick) or \
-                                    (abs(ideal_stop - last_tp_price) >= tick):
+                                elif (abs(eff_entry - last_entry) >= tick) or (abs(ideal_stop - last_tp_price) >= tick):
                                     need_reset_tp = True
+                        else:
+                            need_reset_tp = False
 
                         if need_reset_tp:
                             now_ts = self._now()
