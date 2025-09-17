@@ -53,9 +53,12 @@ def get_position_net_profit(symbol: str, position_id: str | int) -> float | None
     }
     res = _request(method, path, params)
 
-    # 응답 구조: {"code":0,"data":{"records":[{"netProfit": "..."}]}}
+    # 응답 구조: {"code":0,"data":{"positionHistory":[{"netProfit": "..."}]}}
     try:
-        return float(res["data"]["records"][0]["netProfit"])
+        records = res["data"].get("positionHistory", [])
+        if not records:
+            return None
+        return float(records[0]["netProfit"])
     except Exception:
         return None
 
