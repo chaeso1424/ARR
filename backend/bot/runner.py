@@ -689,7 +689,6 @@ class BotRunner:
                     tp_reset_cooldown = 3.0
                     last_tp_reset_ts = 0.0
                     zero_streak = 0
-                    did_cleanup = False
 
                     while not self._stop:
                         time.sleep(POLL_SEC)
@@ -748,6 +747,7 @@ class BotRunner:
                             self._log(f"⚠️ 오픈오더 조회 실패: {e}")
                             open_orders = []
 
+                        # TP 생존 확인 (tracked id 기준)
                         tp_alive = False
                         if self.state.tp_order_id:
                             want = str(self.state.tp_order_id)
@@ -757,6 +757,9 @@ class BotRunner:
                                     tp_alive = True
                                     break
 
+                        did_cleanup = False
+
+                        #--- 종료 판정
                         tick = 10 ** (-pp) if pp > 0 else 0.01
                         min_allowed = max(float(min_qty or 0.0), float(step or 0.0))
                         zero_eps = min_allowed * ZERO_EPS_FACTOR
@@ -897,29 +900,39 @@ class BotRunner:
 
                         need_reset_tp = False
 
-                        # 수량 변화(증가/감소 모두) 감지: 거래소 수량 스텝 기반으로 허용오차 설정
+                        # 수량 변화 감지 (증가/감소 모두)
                         qty_step = float(step or 1.0)
-                        qty_tol  = max(qty_step * 0.5, 1e-12)  # 반 스텝 이상 변하면 '변화'로 간주
-                        qty_changed = abs(inc) >= qty_tol      # inc는 위에서 계산된 (현재qty - 이전스냅샷)
+                        qty_tol  = max(qty_step * 0.5, 1e-12)       # 반 스텝 이상 변화이면 '변화'
+                        qty_changed = abs(inc) >= qty_tol
 
+                        # 유효 평단
                         eff_entry = entry_now if entry_now > 0 else float(last_entry or 0.0)
 
                         if (qty_now >= min_allowed) and (eff_entry > 0):
-                            # 1) TP가 없으면 재설정
+                            # 1) TP 미존재면 세팅
                             if not tp_alive:
                                 need_reset_tp = True
-                            # 2) 포지션 수량이 변했으면 재설정 (핵심 조건)
+                            # 2) 포지션 수량이 변했으면 (DCA/부분청산 등) TP 재설정
                             elif qty_changed:
                                 need_reset_tp = True
                             else:
-                                # 3) 보조 조건: 진입가/이상적 TP가 이전 기록과 '틱' 이상 달라졌으면 재설정
+                                # 3) ROI(4.5% 등) 기준 이상적 stop과 기록된 TP 가격 차이가 커졌거나,
+                                #    평단 자체가 틱 이상 바뀐 경우 재설정
                                 ideal_stop = tp_price_from_roi(
                                     eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp
                                 )
-                                if (last_entry is None) or (last_tp_price is None):
+                                # ★ reduce-only 모드에서는 "목표 TP 수량"도 함께 맞춰야 하므로 아래에서 계산
+                                target_qty = _safe_close_qty(qty_now, step, min_allowed)
+
+                                # last_* 준비 (없다면 무조건 리셋)
+                                if (last_entry is None) or (last_tp_price is None) or (last_tp_qty is None):
                                     need_reset_tp = True
-                                elif (abs(eff_entry - last_entry) >= tick) or (abs(ideal_stop - last_tp_price) >= tick):
-                                    need_reset_tp = True
+                                else:
+                                    price_drift = abs(ideal_stop - last_tp_price) >= 2 * tick
+                                    entry_drift = abs(eff_entry - last_entry)   >= 2 * tick
+                                    qty_drift   = abs(float(target_qty) - float(last_tp_qty)) >= qty_tol
+                                    if price_drift or entry_drift or qty_drift:
+                                        need_reset_tp = True
                         else:
                             need_reset_tp = False
 
