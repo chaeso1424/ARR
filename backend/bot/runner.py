@@ -873,66 +873,80 @@ class BotRunner:
 
                             tp_equal_exists = True
                             tp_equal_id = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
-                            p = o.get("price") or o.get("origPrice") or o.get("limitPrice")
+                            p = o.get("stopPrice") or o.get("triggerPrice") or o.get("price") or o.get("origPrice") or o.get("limitPrice")
                             try:
                                 tp_equal_price = float(p) if p is not None else None
                             except Exception:
                                 tp_equal_price = None
                             break
 
+                        if not hasattr(self, "_tp_seen"):
+                            # (id, stopPrice) 형태로 마지막으로 확인된 TP 상태를 기억
+                            self._tp_seen = (None, None)
+
                         if tp_equal_exists:
+                            # tracked id가 죽어있으면 adopt
                             if not tp_alive:
                                 self.state.tp_order_id = tp_equal_id
-                                if tp_equal_price is not None:
-                                    self._last_tp_price = tp_equal_price
 
-                                # ★ pid도 같이 확보(체결 직전 0으로 사라지는 문제 대비)
+                            # --- stopPrice(또는 triggerPrice) 읽기 ---
+                            cur_stop = tp_equal_price  # 위에서 p를 stopPrice 우선으로 채웠다면 이 값이 곧 stopPrice
+                            # 안전하게 한 번 더 보정 (혹시 위에서 못 읽었을 경우 대비)
+                            if cur_stop is None:
                                 try:
-                                    pid_cache = getattr(self.client, "_last_position_id", {}).get(
-                                        (self.cfg.symbol, self.cfg.side.upper())
-                                    )
+                                    for o in open_orders:
+                                        oid = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
+                                        if oid == str(self.state.tp_order_id or tp_equal_id):
+                                            cur_stop = o.get("stopPrice") or o.get("triggerPrice") \
+                                                    or o.get("price") or o.get("origPrice") or o.get("limitPrice")
+                                            break
                                 except Exception:
-                                    pid_cache = None
-                                self.state.tp_position_id = pid_cache or getattr(self.state, "last_position_id", None)
+                                    cur_stop = None
 
-                                self._log(f"ℹ️ 기존 TP 채택: id={tp_equal_id}")
-                            continue
+                            # 수치화
+                            try:
+                                cur_stop_f = float(cur_stop) if cur_stop is not None else None
+                            except Exception:
+                                cur_stop_f = None
+
+                            # === 스냅샷과 비교: 바뀌었을 때만 갱신/로그 ===
+                            prev_id, prev_stop = self._tp_seen
+                            cur_id = self.state.tp_order_id or tp_equal_id
+
+                            if (cur_id != prev_id) or (cur_stop_f is not None and prev_stop is not None and abs(cur_stop_f - prev_stop) >= (10 ** (-pp))):
+                                # 상태 갱신
+                                self._tp_seen = (cur_id, cur_stop_f)
+                                # 내부 기준값도 업데이트 (리셋 판정에서 사용)
+                                if cur_stop_f is not None:
+                                    last_tp_price = cur_stop_f
+                                    self._last_tp_price = cur_stop_f
+                                # ‘변경되었을 때만’ 로그
+                                self._log(f"ℹ️ 기존 TP 감지/갱신: id={cur_id}, stopPrice={cur_stop_f}")
+
+                        # ===== need_reset_tp 계산부 교체 =====
 
                         need_reset_tp = False
 
-                        # 수량 변화 감지 (증가/감소 모두)
+                        # 수량 변화(증가/감소) 감지: 반 스텝 이상이면 변화로 본다
                         qty_step = float(step or 1.0)
-                        qty_tol  = max(qty_step * 0.5, 1e-12)       # 반 스텝 이상 변화이면 '변화'
-                        qty_changed = abs(inc) >= qty_tol
+                        qty_tol  = max(qty_step * 0.5, 1e-12)
+                        qty_changed = abs(inc) >= qty_tol   # inc는 위에서 prev_qty_snap 대비 변화량
 
-                        # 유효 평단
                         eff_entry = entry_now if entry_now > 0 else float(last_entry or 0.0)
+                        need_reset_tp = False
 
                         if (qty_now >= min_allowed) and (eff_entry > 0):
-                            # 1) TP 미존재면 세팅
-                            if not tp_alive:
+                            if not tp_alive and not tp_equal_exists:
                                 need_reset_tp = True
-                            # 2) 포지션 수량이 변했으면 (DCA/부분청산 등) TP 재설정
                             elif qty_changed:
                                 need_reset_tp = True
                             else:
-                                # 3) ROI(4.5% 등) 기준 이상적 stop과 기록된 TP 가격 차이가 커졌거나,
-                                #    평단 자체가 틱 이상 바뀐 경우 재설정
-                                ideal_stop = tp_price_from_roi(
-                                    eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp
-                                )
-                                # ★ reduce-only 모드에서는 "목표 TP 수량"도 함께 맞춰야 하므로 아래에서 계산
-                                target_qty = _safe_close_qty(qty_now, step, min_allowed)
-
-                                # last_* 준비 (없다면 무조건 리셋)
-                                if (last_entry is None) or (last_tp_price is None) or (last_tp_qty is None):
+                                ideal_stop = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
+                                if (last_entry is None) or (last_tp_price is None):
                                     need_reset_tp = True
-                                else:
-                                    price_drift = abs(ideal_stop - last_tp_price) >= 2 * tick
-                                    entry_drift = abs(eff_entry - last_entry)   >= 2 * tick
-                                    qty_drift   = abs(float(target_qty) - float(last_tp_qty)) >= qty_tol
-                                    if price_drift or entry_drift or qty_drift:
-                                        need_reset_tp = True
+                                elif (abs(eff_entry - last_entry) >= 2 * (10 ** (-pp))) or \
+                                    (abs(ideal_stop - last_tp_price) >= 2 * (10 ** (-pp))):
+                                    need_reset_tp = True
                         else:
                             need_reset_tp = False
 
