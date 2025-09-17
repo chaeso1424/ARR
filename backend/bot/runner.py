@@ -635,7 +635,6 @@ class BotRunner:
 
                         last_entry = None
                         last_tp_price = None
-                        last_tp_qty = None
 
                         if qty_now >= min_allowed:
                             entry = float(self.state.position_avg_price or 0.0)
@@ -662,7 +661,6 @@ class BotRunner:
                                     self.cfg.symbol,
                                     side=tp_side,
                                     stop_price=tp_stop,
-                                    qty=tp_qty,
                                     position_side=tp_pos,
                                 )
                             except Exception as e:
@@ -676,7 +674,6 @@ class BotRunner:
                                 self.state.tp_order_id = str(new_tp_id)
                                 last_entry = entry
                                 last_tp_price = tp_stop
-                                last_tp_qty = tp_qty
                                 self._last_tp_price = tp_stop
                                 self._last_tp_qty = tp_qty
                                 self._log(f"✅ TP(MKT) 배치 완료: id={new_tp_id}, stop={tp_stop}, qty={tp_qty}, side={tp_side}/{tp_pos}")
@@ -684,12 +681,10 @@ class BotRunner:
                                 self._log("ℹ️ 초기 TP 주문 생략")
                                 last_entry = entry
                                 last_tp_price = tp_stop
-                                last_tp_qty = tp_qty
                         else:
                             self._log("ℹ️ 포지션 없음 또는 최소단위 미만 → TP 생략")
                             last_entry = None
                             last_tp_price = None
-                            last_tp_qty = None
 
                     # ===== 5) 모니터링 루프 =====
                     tp_reset_cooldown = 3.0
@@ -849,17 +844,18 @@ class BotRunner:
                             else:
                                 zero_streak = 0
 
-                        # 원하는 방향/포지션
                         want_side = "SELL" if side == "BUY" else "BUY"
                         want_pos  = "LONG" if side == "BUY" else "SHORT"
 
-                        tp_alive = False
-                        found_tp_id = None
-                        found_tp_price = None
+                        tp_equal_exists = False
+                        tp_equal_id = None
+                        tp_equal_price = None
 
                         def _truthy(v):
-                            if isinstance(v, bool): return v
-                            if v is None: return False
+                            if isinstance(v, bool):
+                                return v
+                            if v is None:
+                                return False
                             s = str(v).strip().lower()
                             return s in ("1", "true", "t", "yes", "y", "on")
 
@@ -868,79 +864,72 @@ class BotRunner:
                             o_pos  = str(o.get("positionSide") or o.get("posSide") or o.get("position_side") or "").upper()
                             if (o_side != want_side) or (o_pos != want_pos):
                                 continue
-                            if not _truthy(o.get("reduceOnly") or o.get("reduce_only") or o.get("reduce_only_flag")):
+
+                            reduce_only = _truthy(o.get("reduceOnly") or o.get("reduce_only"))
+                            if not reduce_only:
                                 continue
 
-                            tp_alive = True
-                            found_tp_id = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
-                            p = (o.get("price") or o.get("origPrice") or o.get("limitPrice")
-                                or o.get("stopPrice") or o.get("triggerPrice"))
+                            tp_equal_exists = True
+                            tp_equal_id = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
+                            p = o.get("price") or o.get("origPrice") or o.get("limitPrice")
                             try:
-                                found_tp_price = float(p) if p is not None else None
+                                tp_equal_price = float(p) if p is not None else None
                             except Exception:
-                                found_tp_price = None
+                                tp_equal_price = None
                             break
 
-                        # 가격 캐시만 맞춰둠 (ALL-TP라 qty 캐시는 불필요)
-                        if tp_alive and (found_tp_price is not None):
-                            self._last_tp_price = found_tp_price
+                        if tp_equal_exists:
+                            if not tp_alive:
+                                self.state.tp_order_id = tp_equal_id
+                                if tp_equal_price is not None:
+                                    self._last_tp_price = tp_equal_price
 
-                        # pid 캐시만 업데이트 (채택은 아직 X)
-                        try:
-                            pid_cache = getattr(self.client, "_last_position_id", {}).get(
-                                (self.cfg.symbol, self.cfg.side.upper())
-                            )
-                        except Exception:
-                            pid_cache = None
-                        self.state.tp_position_id = pid_cache or getattr(self.state, "last_position_id", None)
+                                # ★ pid도 같이 확보(체결 직전 0으로 사라지는 문제 대비)
+                                try:
+                                    pid_cache = getattr(self.client, "_last_position_id", {}).get(
+                                        (self.cfg.symbol, self.cfg.side.upper())
+                                    )
+                                except Exception:
+                                    pid_cache = None
+                                self.state.tp_position_id = pid_cache or getattr(self.state, "last_position_id", None)
+
+                                self._log(f"ℹ️ 기존 TP 채택: id={tp_equal_id}")
+                            continue
 
                         need_reset_tp = False
                         eff_entry = entry_now if entry_now > 0 else float(last_entry or 0.0)
-
-                        # DCA 증가 감지
-                        dca_happened = (inc is not None) and (inc > zero_eps)
-
                         if not tp_alive:
                             need_reset_tp = (qty_now >= min_allowed and eff_entry > 0)
                         else:
                             if qty_now >= min_allowed and eff_entry > 0:
                                 ideal_stop = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-
-                                # 캐시 없으면 리셋
                                 if (last_entry is None) or (last_tp_price is None):
                                     need_reset_tp = True
-                                # 가격 차이 크면 리셋
-                                elif (abs(eff_entry - last_entry) >= 2 * tick) or (abs(ideal_stop - last_tp_price) >= 2 * tick):
-                                    need_reset_tp = True
-                                # DCA로 수량이 늘었으면 (평단 변화가 미세해도) 리셋
-                                elif dca_happened:
+                                elif (abs(eff_entry - last_entry) >= tick) or \
+                                    (abs(ideal_stop - last_tp_price) >= tick):
                                     need_reset_tp = True
 
                         if need_reset_tp:
                             now_ts = self._now()
                             if now_ts - last_tp_reset_ts < tp_reset_cooldown:
                                 continue
-
-                            # ⬇️ 기존 TP 취소 (state에 없으면 found_tp_id로 취소)
-                            if tp_alive:
-                                cancel_id = str(self.state.tp_order_id or found_tp_id or "")
-                                if cancel_id:
-                                    try:
-                                        self.client.cancel_order(self.cfg.symbol, cancel_id)
-                                        self._wait_cancel(cancel_id, timeout=2.5)
-                                    except Exception as e:
-                                        self._log(f"⚠️ TP 취소 실패(무시): {e}")
-
+                            if self.state.tp_order_id and tp_alive:
+                                try:
+                                    self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
+                                    self._wait_cancel(self.state.tp_order_id, timeout=2.5)
+                                except Exception as e:
+                                    self._log(f"⚠️ TP 취소 실패(무시): {e}")
                             if eff_entry <= 0 or qty_now < min_allowed:
                                 continue
 
                             new_stop = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
+                            new_qty  = _safe_close_qty(qty_now, step, min_allowed)
                             self._refresh_position()
                             qty_last = float(self.state.position_qty or 0.0)
                             if qty_last < min_allowed:
                                 self._log("ⓘ TP skip: position vanished just before placement (qty=0)")
                                 continue
-
+                            new_qty  = _safe_close_qty(qty_last, step, min_allowed)
                             new_side = "SELL" if side == "BUY" else "BUY"
                             new_pos  = "LONG" if side == "BUY" else "SHORT"
 
@@ -950,32 +939,22 @@ class BotRunner:
                                     side=new_side,
                                     stop_price=new_stop,
                                     position_side=new_pos,
-                                    # close_position=True  # 클라가 지원하면 권장 (ALL-TP)
                                 )
                             except Exception as e:
                                 msg = str(e)
-                                # 거래소가 "이미 주문 있음" 류 에러를 줄 땐, 방금 취소가 반영되기 전일 수 있음
                                 if ("80001" in msg) or ("timed out" in msg.lower()):
                                     continue
                                 else:
                                     raise
 
                             self.state.tp_order_id = str(new_id)
-                            last_entry    = eff_entry
-                            last_tp_price = new_stop
-                            self._last_entry    = eff_entry
+                            last_entry     = eff_entry
+                            last_tp_price  = new_stop
+                            last_tp_qty    = new_qty
                             self._last_tp_price = new_stop
+                            self._last_tp_qty   = new_qty
                             last_tp_reset_ts = now_ts
-                            self._log(f"♻️ TP 재설정(MKT): id={new_id}, stop={new_stop}")
-
-                        else:
-                            # 리셋 불필요 → 여기서 '한 번만' 채택 (중복 채택 방지 가드)
-                            if tp_alive and found_tp_id:
-                                if getattr(self, "_last_tp_adopt_id", None) != found_tp_id:
-                                    self.state.tp_order_id = found_tp_id
-                                    self._last_entry = float(entry_now or 0.0)
-                                    self._last_tp_adopt_id = found_tp_id
-                                    self._log(f"ℹ️ 기존 TP 채택: id={found_tp_id}")
+                            self._log(f"♻️ TP 재설정(MKT): id={new_id}, stop={new_stop}, qty={new_qty}")
 
 
                     # 루프 탈출: repeat면 다시 반복
