@@ -672,7 +672,7 @@ class BingXClient:
             }
             self._snap_cache = snap
             self._snap_ts = time.time()
-            self.log.info(
+            self.log.debug(
                 "SNAPSHOT OK asset=%s bal=%.4f eq=%.4f avail=%.4f",
                 snap["asset"], snap["balance"], snap["equity"], snap["available_margin"]
             )
