@@ -191,14 +191,6 @@ def stop_server_time_sync(join_timeout: float | None = 1.0):
             pass
 
 # ---------- low-level utils ----------
-def _sort_qs_v1(params: dict) -> str:
-    # 키 정렬 + RFC3986 인코딩 (데모와 동일)
-    items = sorted((k, str(v)) for k, v in params.items() if v is not None)
-    return urllib.parse.urlencode(items, safe=":/", quote_via=urllib.parse.quote)
-
-def _sign_hex_str(secret: str, payload: str) -> str:
-    return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
-
 def _ts():
     """서버 오프셋 보정된 epoch(ms)"""
     return int(time.time() * 1000) + _SERVER_OFFSET_MS
@@ -897,9 +889,7 @@ class BingXClient:
     def place_tp_market(self, symbol: str,
                         side: str|None,                 # 포지션 반대 방향(없으면 position_side로 자동결정)
                         stop_price: float,              # 트리거 가격 (필수)
-                        qty: float|None=None,           # ← 무시됨
                         position_side: str|None=None,   # HEDGE 모드에서 LONG/SHORT 지정
-                        close_position: bool=False      # ← 무시되고 항상 True 처리
                         ) -> str:
         """
         TAKE_PROFIT_MARKET 조건부 시장가 익절 주문.
@@ -1090,99 +1080,3 @@ class BingXClient:
         if pid and (_now_ms() - ts) <= max_age_ms:
             return pid
         return None
-
-    # ─────────────────────────────────────────────────────────
-    # Position History (최근 10분 고정) → 행 그대로 반환
-    # GET /openApi/swap/v1/trade/positionHistory
-    # ─────────────────────────────────────────────────────────
-    def get_position_history_exact(
-        self,
-        symbol: str,
-        position_id: str | int) -> list[dict]:
-
-        url = f"{BASE}/openApi/swap/v1/trade/positionHistory"
-
-        try:
-            end_ms = int(time.time() * 1000)
-            start_ms = end_ms - 60 * 60 * 1000
-
-            j = _req_get(url, {
-                "symbol": symbol, 
-                "positionId": str(position_id), 
-                "startTs": start_ms, 
-                "endTs": end_ms, 
-                "pageId": 0,
-                "pageSize": 50
-                },
-                signed=True)
-
-            rows = j.get("data") or j.get("list") or j.get("rows") or []
-            if not isinstance(rows, list):
-                return []
-            return rows
-
-        except Exception:
-            return []
-
-    # ─────────────────────────────────────────────────────────
-    # rows 집계 → realisedProfit, positionCommission, totalFunding 합산
-    # position_profit = realised - commission - funding
-    # ─────────────────────────────────────────────────────────
-    @staticmethod
-    def _D(x):
-        try:
-            if x is None: return Decimal("0")
-            if isinstance(x, Decimal): return x
-            return Decimal(str(x))
-        except (InvalidOperation, ValueError, TypeError):
-            return Decimal("0")
-
-    @classmethod
-    def aggregate_position_history(cls, rows: list[dict]) -> dict:
-        realised   = Decimal("0")
-        commission = Decimal("0")
-        funding    = Decimal("0")
-
-        for r in rows or []:
-            realised   += cls._D(r.get("realisedProfit"))
-            commission += cls._D(r.get("positionCommission"))
-            funding    += cls._D(r.get("totalFunding"))
-
-        position_profit = realised - commission - funding
-        return {
-            "realisedProfit": float(reali := realised),
-            "positionCommission": float(commission),
-            "totalFunding": float(funding),
-            "position_profit": float(position_profit),
-            "_raw_decimal": {
-                "realisedProfit": str(reali),
-                "positionCommission": str(commission),
-                "totalFunding": str(funding),
-                "position_profit": str(position_profit),
-            }
-        }
-
-    # ─────────────────────────────────────────────────────────
-    # 편의 메서드: 최근 10분 profit 집계만 바로 받고 싶을 때
-    # (저장은 러너/서비스 레이어에서 처리 권장)
-    # ─────────────────────────────────────────────────────────
-    def get_position_profit_10m(
-        self,
-        symbol: str,
-        position_id: str | int,
-        *,
-        side: str | None = None,
-        page_index: int = 1,
-        page_size: int = 100,
-        recv_window: int = 60_000,
-    ) -> dict:
-        rows = self.get_position_history_exact(
-            symbol=symbol,
-            position_id=position_id,
-            side=side,
-            page_index=page_index,
-            page_size=page_size,
-            recv_window=recv_window,
-        )
-        return self.aggregate_position_history(rows)
-    

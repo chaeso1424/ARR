@@ -869,13 +869,16 @@ class BotRunner:
                             if (o_side != want_side) or (o_pos != want_pos):
                                 continue
 
-                            reduce_only = _truthy(o.get("reduceOnly") or o.get("reduce_only"))
+                            reduce_only = _truthy(o.get("reduceOnly") or o.get("re  duce_only") or o.get("reduce_only_flag"))
                             if not reduce_only:
                                 continue
 
+                            # ★ 수량 비교는 폐기 (ALL 청산이기 때문)
                             tp_equal_exists = True
                             tp_equal_id = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
-                            p = o.get("price") or o.get("origPrice") or o.get("limitPrice")
+
+                            p = (o.get("price") or o.get("origPrice") or o.get("limitPrice")
+                                or o.get("stopPrice") or o.get("triggerPrice"))
                             try:
                                 tp_equal_price = float(p) if p is not None else None
                             except Exception:
@@ -907,12 +910,10 @@ class BotRunner:
                         else:
                             if qty_now >= min_allowed and eff_entry > 0:
                                 ideal_stop = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-                                ideal_qty  = _safe_close_qty(qty_now, step, min_allowed)
-                                if (last_entry is None) or (last_tp_price is None) or (last_tp_qty is None):
+                                if (last_entry is None) or (last_tp_price is None):
                                     need_reset_tp = True
                                 elif (abs(eff_entry - last_entry) >= 2 * tick) or \
-                                    (abs(ideal_stop - last_tp_price) >= 2 * tick) or \
-                                    (abs(ideal_qty - last_tp_qty) >= float(step or 1.0)):
+                                    (abs(ideal_stop - last_tp_price) >= 2 * tick):
                                     need_reset_tp = True
 
                         if need_reset_tp:
@@ -944,7 +945,6 @@ class BotRunner:
                                     self.cfg.symbol,
                                     side=new_side,
                                     stop_price=new_stop,
-                                    qty=new_qty,
                                     position_side=new_pos,
                                 )
                             except Exception as e:
@@ -957,9 +957,8 @@ class BotRunner:
                             self.state.tp_order_id = str(new_id)
                             last_entry     = eff_entry
                             last_tp_price  = new_stop
-                            last_tp_qty    = new_qty
+                            self._last_entry = eff_entry
                             self._last_tp_price = new_stop
-                            self._last_tp_qty   = new_qty
                             last_tp_reset_ts = now_ts
                             self._log(f"♻️ TP 재설정(MKT): id={new_id}, stop={new_stop}, qty={new_qty}")
 
