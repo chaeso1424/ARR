@@ -38,5 +38,5 @@ def get_position_net_profit(symbol: str, position_id: str | int) -> float | None
 
 
 if __name__ == "__main__":
-    result = get_position_net_profit("BTC-USDT", 1968000264838533120)
+    result = get_position_net_profit("BTC-USDT", 1968121039583137792)
     print("최종 반환값:", result)

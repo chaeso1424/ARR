@@ -837,8 +837,7 @@ class BotRunner:
                                     )
 
                                     self._log(
-                                        "📈 TP 집계(vi_api): pnl=%.6f, qty=%s, price=%s, pos_id=%s",
-                                        pnl_api, qty_now, mark, pos_id
+                                        f"📈 TP 집계: symbol={self.cfg.symbol}, pnl={pnl_api:.6f}, pos_id={pos_id}"
                                     )
                                     self._last_nonzero_qty = 0.0
 
