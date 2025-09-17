@@ -882,16 +882,19 @@ class BotRunner:
                                 tp_equal_price = None
                             break
 
+                        if tp_equal_exists:
+                            tp_alive = True
+
                         if not hasattr(self, "_tp_seen"):
                             # (id, stopPrice) 형태로 마지막으로 확인된 TP 상태를 기억
                             self._tp_seen = (None, None)
 
-                        if tp_equal_exists and self._tp_detect_enabled:
-                            # tp_alive가 아니면 adopt (tracked id 업데이트)
+                        if tp_equal_exists and getattr(self, "_tp_detect_enabled", False):
+                            # tracked id가 죽어있으면 adopt
                             if not tp_alive:
                                 self.state.tp_order_id = tp_equal_id
 
-                            # stopPrice 우선 취득
+                            # stopPrice 우선
                             cur_stop = tp_equal_price
                             if cur_stop is None:
                                 try:
@@ -904,13 +907,12 @@ class BotRunner:
                                 except Exception:
                                     cur_stop = None
 
-                            # 수치화
                             try:
                                 cur_stop_f = float(cur_stop) if cur_stop is not None else None
                             except Exception:
                                 cur_stop_f = None
 
-                            # 스냅샷 비교: 바뀌었을 때만 로그
+                            # 스냅샷과 비교해 바뀌었을 때만 로그
                             prev_id, prev_stop = (self._tp_seen if hasattr(self, "_tp_seen") else (None, None))
                             cur_id = self.state.tp_order_id or tp_equal_id
 
@@ -925,7 +927,10 @@ class BotRunner:
                                     self._last_tp_price = cur_stop_f
                                 self._log(f"ℹ️ 기존 TP 감지/갱신: id={cur_id}, stopPrice={cur_stop_f}")
 
-                            # ★ 원샷: 어태치 모드에서 기존 TP를 확인/채택했으니 더는 감지/로그 하지 않음
+                            # 이번 루프에선 확실히 TP 존재로 처리 (중복 생성 방지)
+                            tp_alive = True
+
+                            # 원샷 종료: 같은 사이클에서 더 이상 감지/로그 하지 않음
                             self._tp_detect_enabled = False
 
                         # ===== need_reset_tp 계산부 교체 =====
@@ -965,17 +970,19 @@ class BotRunner:
                                     self._wait_cancel(self.state.tp_order_id, timeout=2.5)
                                 except Exception as e:
                                     self._log(f"⚠️ TP 취소 실패(무시): {e}")
+
+                                    
                             if eff_entry <= 0 or qty_now < min_allowed:
                                 continue
 
                             new_stop = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-                            new_qty  = _safe_close_qty(qty_now, step, min_allowed)
                             self._refresh_position()
                             qty_last = float(self.state.position_qty or 0.0)
                             if qty_last < min_allowed:
                                 self._log("ⓘ TP skip: position vanished just before placement (qty=0)")
                                 continue
                             new_qty  = _safe_close_qty(qty_last, step, min_allowed)
+
                             new_side = "SELL" if side == "BUY" else "BUY"
                             new_pos  = "LONG" if side == "BUY" else "SHORT"
 
@@ -996,7 +1003,6 @@ class BotRunner:
                             self.state.tp_order_id = str(new_id)
                             last_entry     = eff_entry
                             last_tp_price  = new_stop
-                            last_tp_qty    = new_qty
                             self._last_tp_price = new_stop
                             self._last_tp_qty   = new_qty
                             last_tp_reset_ts = now_ts
