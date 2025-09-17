@@ -13,6 +13,7 @@ from models.state import BotState
 from services.bingx_client import BingXClient
 from redis_helper import get_redis
 import os
+from services.v1_api import get_position_net_profit
 
 # ===== 운영 파라미터 =====
 RESTART_DELAY_SEC = int(os.getenv("RESTART_DELAY_SEC", "55"))   # TP 후 다음 사이클 대기
@@ -792,21 +793,18 @@ class BotRunner:
 
                                 self._log("✅ 포지션 종료 확정(연속검증+이중확인) → 대기")                                
 
-                                # --- TP 집계 (positionHistory v1) ---
+                                # --- TP 집계 (vi_api: netProfit 단일 조회) ---
                                 try:
-                                    # 3-1) pos_id 확보(폴백 포함)
+                                    # 1) pos_id 확보 (기존 로직 그대로 활용)
                                     pos_id = getattr(self.state, "tp_position_id", None) or getattr(self.state, "last_position_id", None)
 
                                     if not pos_id:
-                                        # 내부 캐시 갱신 시도(실패해도 무시)
                                         try:
                                             _ = self.client.position_info(self.cfg.symbol, self.cfg.side)
                                         except Exception:
                                             pass
-                                        # 클라이언트에 recent pid 헬퍼가 있다면 사용(없어도 무방)
                                         if hasattr(self.client, "get_recent_position_id"):
                                             pos_id = self.client.get_recent_position_id(self.cfg.symbol, self.cfg.side, max_age_ms=120_000)
-                                        # 마지막 폴백: 내부 dict 직접 조회
                                         if not pos_id:
                                             try:
                                                 pos_id = getattr(self.client, "_last_position_id", {}).get(
@@ -817,77 +815,30 @@ class BotRunner:
 
                                     if not pos_id:
                                         raise RuntimeError("missing position_id for TP settlement")
-                                    
-                                    self._log(pos_id)
-                                    self._log(self.cfg.symbol)
 
-                                    # 3-3) positionHistory 조회(체결 반영 지연 대비 3회까지 짧게 재시도)
-                                    rows = []
-                                    for _ in range(3):
-                                        rows = self.client.get_position_history_exact(
-                                            symbol=self.cfg.symbol,
-                                            position_id=pos_id,
-                                        )
-                                        if rows:
-                                            break
-                                        time.sleep(1.0)  # 1초 대기 후 재시도
+                                    self._log(f"pos_id={pos_id}, symbol={self.cfg.symbol}")
 
-                                    if not rows:
-                                        raise RuntimeError("no positionHistory rows")
+                                    # 2) vi_api를 통해 netProfit 단일 조회
+                                    pnl_api = get_position_net_profit(self.cfg.symbol, pos_id)
 
-                                    # 3-4) 합계: realisedProfit - positionCommission - totalFunding
-                                    agg = self.client.aggregate_position_history(rows)
-                                    pnl_api = float(agg["position_profit"])
+                                    if pnl_api is None:
+                                        raise RuntimeError("no netProfit from vi_api")
 
-                                    # 3) 수량/평단 계산 (rows 기반 보강) ─ 기존 그대로
-                                    def _f(x, default=0.0):
-                                        try: return float(x)
-                                        except Exception: return default
-
-                                    qty_api_sum = sum(abs(_f(r.get("closePositionAmt"))) for r in rows if r.get("closePositionAmt") is not None)
-                                    qty_api = qty_api_sum if qty_api_sum > 0 else None
-
-                                    w_num, w_den = 0.0, 0.0
-                                    for r in rows:
-                                        q = abs(_f(r.get("closePositionAmt")))
-                                        p = r.get("avgClosePrice")
-                                        if p is not None and q > 0:
-                                            w_num += _f(p) * q
-                                            w_den += q
-                                    avg_close_price = (w_num / w_den) if w_den > 0 else None
-
-                                    if hasattr(self, "_last_nonzero_qty") and float(self._last_nonzero_qty) > 0:
-                                        closed_qty = float(self._last_nonzero_qty)
-                                    elif hasattr(self, "_prev_qty_snap") and float(self._prev_qty_snap) > 0:
-                                        closed_qty = float(self._prev_qty_snap)
-                                    else:
-                                        closed_qty = float(qty_now)
-
-                                    tp_price = float(self._last_tp_price or 0.0) or float(mark)
-                                    if avg_close_price is not None:
-                                        tp_price = float(avg_close_price)
-
-                                    eff_entry = float(entry_now or 0.0) if (entry_now and entry_now > 0) else float(last_entry or 0.0)
-                                    if eff_entry <= 0:
-                                        eff_entry = float(self.state.position_avg_price or 0.0) or float(mark)
-
-                                    final_qty = float(qty_api) if (qty_api and qty_api > 0) else float(closed_qty)
-
+                                    # 3) 기존 record_event는 동일하게 유지
                                     record_event(
                                         kind="TP",
-                                        symbol=self.cfg.symbol,   # 표시/기록은 원래 심볼로 유지
-                                        price=float(tp_price),
-                                        qty=final_qty,
+                                        symbol=self.cfg.symbol,
+                                        price=float(mark),       # TP 가격은 현 시세/평단 등 기존 값 사용
+                                        qty=float(qty_now),      # 현재 수량 그대로 사용
                                         ts_ms=self._ts_ms(),
                                         pnl=float(round(pnl_api, 10)),
                                         side=self.cfg.side.upper(),
-                                        entry_price=eff_entry,
+                                        entry_price=float(entry_now or last_entry or 0.0),
                                     )
 
                                     self._log(
-                                        "📈 TP 집계(v1 posHistory): pnl=%.6f, qty=%s, price=%s, pos_id=%s, rows=%d, realised=%.6f, commission=%.6f, funding=%.6f, sym_v1=%s",
-                                        pnl_api, final_qty, tp_price, pos_id, len(rows),
-                                        agg.get("realisedProfit", 0.0), agg.get("positionCommission", 0.0), agg.get("totalFunding", 0.0)
+                                        "📈 TP 집계(vi_api): pnl=%.6f, qty=%s, price=%s, pos_id=%s",
+                                        pnl_api, qty_now, mark, pos_id
                                     )
                                     self._last_nonzero_qty = 0.0
 
