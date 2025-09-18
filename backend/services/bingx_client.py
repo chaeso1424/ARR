@@ -1056,7 +1056,7 @@ class BingXClient:
                     pass
 
         pid = None
-        for k in ("positionId"):
+        for k in ("positionId", "position_id"):
             v = pos.get(k)
             if v not in (None, ""):
                 pid = str(v)
