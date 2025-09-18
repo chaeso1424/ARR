@@ -592,9 +592,6 @@ class BingXClient:
         return self.get_last_price(symbol)
     
 
-    #
-    
-
     # ─────────────────────────────────────────────
     # 1) USDT 항목을 안전하게 찾아주는 헬퍼(FrontEnd)
     # ─────────────────────────────────────────────
@@ -954,17 +951,11 @@ class BingXClient:
             return True
         except Exception as e:
             msg = str(e)
-            # 이미 취소된 주문 → 조용히 무시
+            # 이미 정리된 주문 → 조용히 무시
             if any(code in msg for code in ("80018", "109414", "not exist", "does not exist", "unknown order")):
                 return False
-            # ❗ 레이트리밋/네트워크 오류도 무해하게 처리
-            if "100410" in msg or "109501" in msg or "network issue" in msg.lower():
-                self.log.warning(f"cancel_order deferred: {e}")
-                return False
-            # 진짜 심각한 오류만 남김
             log(f"⚠️ cancel_order: {e}")
             return False
-
         
 
 
