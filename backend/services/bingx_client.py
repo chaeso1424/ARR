@@ -361,7 +361,7 @@ class BingXClient:
         self._snap_ts = 0.0                # 스냅샷 시각(epoch sec)
         self._snap_block_until = 0.0       # 레이트리밋 해제 예정 시각(epoch sec)
         self.log = logging.getLogger("bingx.client")
-        
+
 
         # ✅ 시작 직후 1회 서버타임 동기화(실패해도 무시)
         try:
@@ -1056,7 +1056,7 @@ class BingXClient:
                     pass
 
         pid = None
-        for k in ("positionId", "id", "position_id"):
+        for k in ("positionId"):
             v = pos.get(k)
             if v not in (None, ""):
                 pid = str(v)
@@ -1066,6 +1066,7 @@ class BingXClient:
         if pid:
             self._last_position_id[cache_key] = pid
             self._last_position_id_ts[cache_key] = _now_ms()
+
         return entry, qty
     
     def get_recent_position_id(self, symbol: str, side: str, max_age_ms: int = 120_000) -> str | None:
@@ -1080,3 +1081,5 @@ class BingXClient:
         if pid and (_now_ms() - ts) <= max_age_ms:
             return pid
         return None
+
+        

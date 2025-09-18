@@ -709,13 +709,26 @@ class BotRunner:
 
                             # [PID capture] 포지션이 살아있는 동안 최신 positionId를 붙잡아 둔다
                             try:
-                                pid_cache = getattr(self.client, "_last_position_id", {}).get(
-                                    (self.cfg.symbol, self.cfg.side.upper())
-                                )
+                                key = (self.cfg.symbol, self.cfg.side.upper())
+
+                                # 1) 현재 스냅샷에서 바로 잡힌 pid 우선
+                                pid_cache = getattr(self.client, "_last_position_id", {}).get(key)
+
+                                # 2) 없으면 최근값 fallback(2분 이내)
+                                if not pid_cache and hasattr(self.client, "get_recent_position_id"):
+                                    pid_cache = self.client.get_recent_position_id(self.cfg.symbol, self.cfg.side, max_age_ms=120_000)
+
+                                # --- 최소 유효성 가드(인라인): 숫자이고 자리수 충분한 값만 허용 ---
+                                if pid_cache:
+                                    pid_cache = str(pid_cache).strip()
+                                    # 지수표기/소수점/음수 방지 + 자리수 하한(12자리 권장)
+                                    if not (pid_cache.isdigit() and len(pid_cache) >= 12):
+                                        pid_cache = None
+
+                                # qty가 사실상 0이 아니고(pid가 유효)일 때에만 상태 갱신
                                 if pid_cache and qty_now_for_dca >= zero_eps:
-                                    # 다음 단계에서 쓸 수 있도록 두 곳 모두 갱신
                                     self.state.last_position_id = pid_cache
-                                    self.state.tp_position_id = pid_cache
+                                    self.state.recent_position_id = pid_cache
                             except Exception:
                                 pass
 
@@ -797,8 +810,9 @@ class BotRunner:
                                     # --- TP 집계 (vi_api: netProfit 단일 조회) ---
                                     try:
                                         # 1) pos_id 확보 (기존 로직 그대로 활용)
-                                        pos_id = getattr(self.state, "tp_position_id", None) or getattr(self.state, "last_position_id", None)
-
+                                        pos_id = (getattr(self.state, "recent_position_id", None)
+                                                or getattr(self.state, "last_position_id", None))
+                                        
                                         if not pos_id:
                                             try:
                                                 _ = self.client.position_info(self.cfg.symbol, self.cfg.side)
@@ -814,8 +828,8 @@ class BotRunner:
                                                 except Exception:
                                                     pos_id = None
 
-                                        if not pos_id:
-                                            raise RuntimeError("missing position_id for TP settlement")
+                                        if not (pos_id and str(pos_id).strip().isdigit()):
+                                            raise RuntimeError("missing/invalid position_id for TP settlement")
 
                                         self._log(f"pos_id={pos_id}, symbol={self.cfg.symbol}")
 
