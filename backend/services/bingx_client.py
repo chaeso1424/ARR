@@ -71,6 +71,38 @@ _TIME_SYNC_STOP = threading.Event()
 MAX_RETRIES = int(os.getenv("BINGX_MAX_RETRIES", "3"))
 RETRY_DELAY = float(os.getenv("BINGX_RETRY_DELAY", "30"))
 
+#late limit 시작 시 오픈오더 정리 로직
+_RATE_LIMIT_MS_RE = re.compile(r"unblocked after\s+(\d{13,})")
+
+def _extract_unblock_ms(err_msg: str) -> float | None:
+    if not err_msg:
+        return None
+    m = _RATE_LIMIT_MS_RE.search(err_msg)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))  # epoch milliseconds
+    except Exception:
+        return None
+
+def _sleep_until_unblock(err_msg: str, *, max_wait_sec: float = 60.0, jitter_sec: float = 0.15) -> float:
+    """
+    메시지에서 'unblocked after <ms>'를 읽어 그 시각까지 대기.
+    반환값: 실제로 잔여 대기한 초(대기 안 하면 0.0)
+    """
+    unblock_ms = _extract_unblock_ms(err_msg)
+    if not unblock_ms:
+        return 0.0
+    now_ms = time.time() * 1000.0
+    wait_s = max(0.0, (unblock_ms - now_ms) / 1000.0)
+    # 미세한 경쟁을 피하려고 약간의 지터를 더해줌
+    wait_s = min(wait_s + jitter_sec, max_wait_sec)
+    if wait_s > 0.01:
+        time.sleep(wait_s)
+        return wait_s
+    return 0.0
+#여기까지   
+
 def _now_ms():
     import time as _t
     return int(_t.time() * 1000)
@@ -591,6 +623,7 @@ class BingXClient:
             log(f"⚠️ get_mark_price fallback to last price: {e}")
         return self.get_last_price(symbol)
     
+    
 
     # ─────────────────────────────────────────────
     # 1) USDT 항목을 안전하게 찾아주는 헬퍼(FrontEnd)
@@ -940,21 +973,51 @@ class BingXClient:
 
 
 
-    def cancel_order(self, symbol: str, order_id: str) -> bool:
+    def cancel_order(self, symbol: str, order_id: str | int, client_order_id: str | None = None) -> bool:
         url = f"{BASE}/openApi/swap/v2/trade/order"
+        params = {
+            "symbol": symbol,
+            "recvWindow": 60000,
+            "timestamp": _ts(),
+        }
+        if order_id is not None:
+            try:
+                params["orderId"] = int(order_id)
+            except Exception:
+                params["orderId"] = str(order_id)
+        if client_order_id:
+            params["clientOrderId"] = client_order_id
+
+        # 1차 시도
         try:
-            _req_delete(
-                url,
-                {"symbol": symbol, "orderId": int(order_id), "recvWindow": 60000, "timestamp": _ts()},
-                signed=True,
-            )
+            _req_delete(url, params, signed=True)
             return True
         except Exception as e:
-            msg = str(e)
-            # 이미 정리된 주문 → 조용히 무시
-            if any(code in msg for code in ("80018", "109414", "not exist", "does not exist", "unknown order")):
+            msg = str(e) or ""
+            # 이미 취소/존재 안 함 → 실패로 처리하되 예외는 던지지 않음
+            if any(k in msg for k in ("80018", "109414", "not exist", "does not exist", "unknown order")):
+                log(f"ℹ️ cancel_order: already gone ({msg})")
                 return False
-            log(f"⚠️ cancel_order: {e}")
+
+            # === 여기서 100410인 경우 '정확히' 대기 후 1회 재시도 ===
+            if "100410" in msg:
+                waited = _sleep_until_unblock(msg, max_wait_sec=90.0, jitter_sec=0.2)
+                log(f"⌛ rate-limit 100410: waited {waited:.2f}s, retrying cancel...")
+                try:
+                    _req_delete(url, params, signed=True)
+                    return True
+                except Exception as e2:
+                    # 2차 실패도 조용히 False (runner가 다음 틱에서 다시 시도)
+                    log(f"⚠️ cancel_order retry failed after wait: {e2}")
+                    return False
+
+            # 네트워크 등 일시 오류는 False로 넘김(러너가 재시도)
+            if "109501" in msg or "network issue" in msg.lower():
+                log(f"⚠️ cancel_order network issue: {msg}")
+                return False
+
+            # 그 외는 치명도 낮게: False로 반환(필요시 raise로 바꿔도 됨)
+            log(f"⚠️ cancel_order error: {msg}")
             return False
         
 
