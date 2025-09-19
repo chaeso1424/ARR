@@ -139,13 +139,6 @@ def server_time_ms() -> int:
 def server_offset_ms() -> int:
     return _SERVER_OFFSET_MS
 
-def _sync_server_time_once() -> bool:
-    """
-    기존에 쓰던 구현 유지. 실패 시 예외 던지지 말고 False 반환 + log만.
-    - 내부에서 BASE, _session, TIMEOUT, _SERVER_OFFSET_MS 사용
-    """
-    # ← 당신이 기존에 쓰던 안전한 버전(예외 삼킴) 그대로 두세요.
-    ...
 
 def start_server_time_sync(interval_sec: int = 600, jitter_sec: int = 0) -> bool:
     """이미 실행 중이면 False, 새로 시작하면 True 반환."""
@@ -353,22 +346,28 @@ def _make_cid(tag: str) -> str:
 
 # ---------- high-level client ----------
 class BingXClient:
-    def __init__(self):
-        self._spec_cache: dict[str, dict] = {}
-        self._last_position: dict[tuple[str, str], tuple[float, float]] = {}
+    def __init__(self, bot_id: str | None = None):
+        self.bot_id = bot_id
+        self._lock = threading.RLock()
 
-        self._snap_cache = None            # 마지막 정상 스냅샷
-        self._snap_ts = 0.0                # 스냅샷 시각(epoch sec)
-        self._snap_block_until = 0.0       # 레이트리밋 해제 예정 시각(epoch sec)
+
+        # caches
+        self._spec_cache: dict[str, dict] = {}
+        self._last_position: dict[tuple[str, str, str], tuple[float, float]] = {}
+        self._last_position_id: dict[tuple[str, str, str], str] = {}
+        self._last_position_id_ts: dict[tuple[str, str, str], int] = {}
+
+
+        self._snap_cache = None
+        self._snap_ts = 0.0
+        self._snap_block_until = 0.0
         self.log = logging.getLogger("bingx.client")
 
 
-        # ✅ 시작 직후 1회 서버타임 동기화(실패해도 무시)
         try:
             _sync_server_time_once()
         except Exception:
             pass
-        
         self._start_initial_fetch()
 
     def get_current_leverage(self, symbol: str, side: str) -> float | None:
@@ -974,15 +973,15 @@ class BingXClient:
         NOTE: positionId도 함께 파싱해 내부 캐시에 저장하지만, 반환값은 (entry, qty)로 유지합니다.
         """
         url = f"{BASE}/openApi/swap/v2/user/positions"
-        cache_key = (str(symbol), str(side).upper())
+        cache_key = (self.bot_id, str(symbol), str(side).upper())
 
-        # 내부 캐시 초기화(최초 1회)
-        if not hasattr(self, "_last_position"):
-            self._last_position = {}
-        if not hasattr(self, "_last_position_id"):
-            self._last_position_id = {}
-        if not hasattr(self, "_last_position_id_ts"):
-            self._last_position_id_ts = {}
+        with self._lock:
+            if not hasattr(self, "_last_position"):
+                self._last_position = {}
+            if not hasattr(self, "_last_position_id"):
+                self._last_position_id = {}
+            if not hasattr(self, "_last_position_id_ts"):
+                self._last_position_id_ts = {}
 
         # 네트워크 실패 시 기존 (entry, qty) 캐시 반환
         def _from_cache():
@@ -1009,9 +1008,9 @@ class BingXClient:
                 break
 
         if not pos:
-            # 포지션 없음: 두 캐시 갱신
-            self._last_position[cache_key] = (0.0, 0.0)
-            return 0.0, 0.0 
+            with self._lock:
+                self._last_position[cache_key] = (0.0, 0.0)
+            return 0.0, 0.0
 
         # entry (avg price)
         entry = 0.0
@@ -1044,24 +1043,20 @@ class BingXClient:
                 pid = str(v)
                 break
 
-        self._last_position[cache_key] = (entry, qty)
-        if pid:
-            self._last_position_id[cache_key] = pid
-            self._last_position_id_ts[cache_key] = _now_ms()
+        with self._lock:
+            self._last_position[cache_key] = (entry, qty)
+            if pid:
+                self._last_position_id[cache_key] = pid
+                self._last_position_id_ts[cache_key] = _now_ms()
 
         return entry, qty
     
     def get_recent_position_id(self, symbol: str, side: str, max_age_ms: int = 120_000) -> str | None:
-        """
-        포지션이 0이 된 뒤에도 '최근 max_age_ms 이내'에 본 positionId가 있으면 반환
-        """
-        if not hasattr(self, "_last_position_id") or not hasattr(self, "_last_position_id_ts"):
-            return None
-        key = (str(symbol), str(side).upper())
-        pid = self._last_position_id.get(key)
-        ts  = self._last_position_id_ts.get(key, 0)
+        key = (self.bot_id, str(symbol), str(side).upper())
+        with self._lock:
+            pid = self._last_position_id.get(key)
+            ts  = self._last_position_id_ts.get(key, 0)
         if pid and (_now_ms() - ts) <= max_age_ms:
             return pid
         return None
-
         
