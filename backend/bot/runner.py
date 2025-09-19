@@ -24,6 +24,7 @@ HB_TTL_SEC        = 180  # 하트비트 TTL
 RUN_FLAG_TTL_SEC  = 180  # run-flag TTL
 
 
+
 class BotRunner:
     def __init__(self, cfg: BotConfig, state: BotState, client: BingXClient, bot_id: str):
         self.cfg = cfg
@@ -35,10 +36,15 @@ class BotRunner:
         self._hb_stop = False
         self._lev_checked_this_cycle = False
         self._owner = f"{uuid.uuid4().hex}"
+        
 
 
         self.bot_id = bot_id
         base = Path(__file__).resolve().parents[1]  # 프로젝트 루트 기준 조정
+
+        # TP 집계 및 BingXclient 정보저장 봇별
+        self.client = BingXClient(bot_id=self.bot_id)
+        self._lock = threading.RLock()
 
         # TP 기준값(모니터링 데드밴드용)
         self._last_tp_price: float | None = None
@@ -224,7 +230,8 @@ class BotRunner:
         want = str(order_id)
         while time.time() - t0 < timeout:
             try:
-                oo = self.client.open_orders(self.cfg.symbol)
+                with self._lock:
+                    oo = self.client.open_orders(self.cfg.symbol)
                 alive = any(
                     str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
                     == want
@@ -278,7 +285,8 @@ class BotRunner:
     def _refresh_position(self) -> None:
         """스티키 평균가: qty>0인데 avg=0이면 이전 avg 유지."""
         old_avg = float(self.state.position_avg_price or 0.0)
-        avg, qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
+        with self._lock:
+            avg, qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
         if qty > 0 and (avg is None or avg <= 0) and old_avg > 0:
             avg = old_avg
         self.state.position_avg_price = avg
@@ -290,7 +298,8 @@ class BotRunner:
         sym = self.cfg.symbol
         for _ in range(max(1, rounds)):
             try:
-                open_orders = self.client.open_orders(sym) or []
+                with self._lock:
+                    open_orders = self.client.open_orders(sym) or []
             except Exception as e:
                 self._log(f"⚠️ 오픈오더 조회 실패: {e}")
                 return False
@@ -318,7 +327,8 @@ class BotRunner:
 
             for oid in targets:
                 try:
-                    self.client.cancel_order(sym, oid)
+                    with self._lock:
+                        self.client.cancel_order(sym, oid)
                     self._log(f"🧹 오픈오더 취소: {oid}")
                 except Exception as e:
                     m = str(e).lower()
@@ -331,7 +341,8 @@ class BotRunner:
 
         # 최종 확인(필터 적용)
         try:
-            remain = self.client.open_orders(sym) or []
+            with self._lock:
+                remain = self.client.open_orders(sym) or []
             for o in remain:
                 if filter_side:
                     o_side = str(o.get("side") or o.get("orderSide") or "").upper()
@@ -380,7 +391,8 @@ class BotRunner:
         # 0) 우리가 트래킹하던 ID 우선 취소(한 번만)
         for oid in list(self.state.open_limit_ids):
             try:
-                self.client.cancel_order(sym, oid)
+                with self._lock:
+                    self.client.cancel_order(sym, oid)
             except Exception as e:
                 msg = str(e).lower()
                 if any(k in msg for k in ("80018","not exist","does not exist","unknown order","filled","canceled","cancelled")):
@@ -394,7 +406,8 @@ class BotRunner:
 
             # 1) 현재 오픈오더 조회
             try:
-                open_orders = self.client.open_orders(sym) or []
+                with self._lock:
+                    open_orders = self.client.open_orders(sym) or []
             except Exception as e:
                 self._log(f"⚠️ 오픈오더 조회 실패: {e}")
                 # 조회가 실패해도 재시도 라운드 진행
@@ -454,7 +467,8 @@ class BotRunner:
             cancelled_any = False
             for oid in danger:
                 try:
-                    self.client.cancel_order(sym, oid)
+                    with self._lock:
+                        self.client.cancel_order(sym, oid)
                     cancelled_any = True
                 except Exception as e:
                     msg = str(e).lower()
@@ -485,7 +499,9 @@ class BotRunner:
                     try:
                         # 1) 정밀도/스펙 동기화
                         try:
-                            pp, qp = self.client.get_symbol_filters(self.cfg.symbol)
+                            with self._lock:
+                                pp, qp = self.client.get_symbol_filters(self.cfg.symbol)
+
                             self.cfg.price_precision = pp
                             self.cfg.qty_precision = qp
                             self._log(f"ℹ️ precision synced: price={pp}, qty={qp}")
@@ -493,7 +509,8 @@ class BotRunner:
                             self._log(f"⚠️ precision sync failed: {e}")
                             pp, qp = 4, 0
 
-                        spec = self.client.get_contract_spec(self.cfg.symbol)
+                        with self._lock:
+                            spec = self.client.get_contract_spec(self.cfg.symbol)
                         pp = int(spec.get("pricePrecision", pp))
                         qp = int(spec.get("quantityPrecision", qp))
                         contract = float(spec.get("contractSize", 1.0)) or 1.0
@@ -504,11 +521,13 @@ class BotRunner:
                         self._log(f"ℹ️ spec: contractSize={contract}, minQty={min_qty}, qtyStep={step}, pp={pp}, qp={qp}")
 
                         side = self.cfg.side.upper()
-                        mark = float(self.client.get_mark_price(self.cfg.symbol))
+                        with self._lock:
+                            mark = float(self.client.get_mark_price(self.cfg.symbol))
 
                         # ---- 현재 포지션 파악(attach 모드 여부 선결정) ----
                         try:
-                            pre_avg, pre_qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
+                            with self._lock:
+                                pre_avg, pre_qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
                         except Exception:
                             pre_avg, pre_qty = 0.0, 0.0
                         min_live_qty = max(float(min_qty or 0.0), float(step or 0.0))
@@ -519,11 +538,13 @@ class BotRunner:
 
                         # 0) 가용 USDT 체크 (attach 모드면 패스 가능)
                         try:
-                            av = float(self.client.get_available_usdt())
+                            with self._lock:
+                                av = float(self.client.get_available_usdt())
                             if av < 0.99:  # 1차 조회 결과가 0에 가까움
                                 self._log("⚠️ 가용 USDT 0 → 재측정 시도")
                                 time.sleep(1)
-                                av = float(self.client.get_available_usdt())
+                                with self._lock:
+                                    av = float(self.client.get_available_usdt())
                         except Exception as e:
                             self._log(f"❌ 가용잔고 조회 실패: {e}")
                             av = 0.0
@@ -538,7 +559,8 @@ class BotRunner:
                         if not attach_mode:
                             required, plan = self._estimate_required_margin(side, mark, spec, pp, step)
                             try:
-                                av = float(self.client.get_available_usdt())
+                                with self._lock:
+                                    av = float(self.client.get_available_usdt())
                             except Exception:
                                 pass
                             self.state.budget_ok = av + 1e-9 >= required
@@ -574,7 +596,8 @@ class BotRunner:
 
                             if not self._lev_checked_this_cycle:
                                 try:
-                                    lev_now = self.client.get_current_leverage(self.cfg.symbol, self.cfg.side)
+                                    with self._lock:
+                                        lev_now = self.client.get_current_leverage(self.cfg.symbol, self.cfg.side)
                                     if lev_now is not None:
                                         want = float(self.cfg.leverage)
                                         diff = abs(lev_now - want) / max(want, 1.0)
@@ -609,7 +632,8 @@ class BotRunner:
                                 self._log(f"⚠️ 1차 수량이 최소수량 미달(raw={raw_qty}) → {max(min_qty, step)}로 보정")
                                 qty = max(min_qty, step)
                             try:
-                                oid = self.client.place_market(self.cfg.symbol, side, qty)
+                                with self._lock:
+                                    oid = self.client.place_market(self.cfg.symbol, side, qty)
                             except Exception as e:
                                 msg = str(e)
                                 if "80001" in msg:
@@ -650,9 +674,11 @@ class BotRunner:
                             base_price = float(self.state.position_avg_price or 0.0)
                             if base_price <= 0:
                                 try:
-                                    base_price = float(self.client.get_mark_price(self.cfg.symbol))
+                                    with self._lock:
+                                        base_price = float(self.client.get_mark_price(self.cfg.symbol))
                                 except Exception:
-                                    base_price = float(self.client.get_last_price(self.cfg.symbol))
+                                    with self._lock:
+                                        base_price = float(self.client.get_last_price(self.cfg.symbol))
                                 self._log(f"⚠️ avg_price=0 → fallback base_price={base_price} (DCA initial only)")
 
                             #DCA
@@ -674,13 +700,14 @@ class BotRunner:
                                     self._log(f"⚠️ {i}차 수량이 최소수량 미달(raw={raw_qty}) → {max(min_qty, step)}로 보정")
                                     q = max(min_qty, step)
                                 try:
-                                    lid = self.client.place_limit(
-                                        self.cfg.symbol,
-                                        side,
-                                        q,
-                                        price,
-                                        position_side=entry_pos_side,
-                                    )
+                                    with self._lock:
+                                        lid = self.client.place_limit(
+                                            self.cfg.symbol,
+                                            side,
+                                            q,
+                                            price,
+                                            position_side=entry_pos_side,
+                                        )
                                 except Exception as e:
                                     msg = str(e)
                                     if "80001" in msg:
@@ -707,9 +734,11 @@ class BotRunner:
                                 entry = float(self.state.position_avg_price or 0.0)
                                 if entry <= 0:
                                     try:
-                                        entry = float(self.client.get_mark_price(self.cfg.symbol))
+                                        with self._lock:
+                                            entry = float(self.client.get_mark_price(self.cfg.symbol))
                                     except Exception:
-                                        entry = float(self.client.get_last_price(self.cfg.symbol))
+                                        with self._lock:
+                                            entry = float(self.client.get_last_price(self.cfg.symbol))
                                     self._log(f"⚠️ avg_price=0 → fallback entry={entry} (initial only)")
 
                                 tp_stop = tp_price_from_roi(entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
@@ -724,12 +753,13 @@ class BotRunner:
                                 new_tp_id: str | None = None
 
                                 try:
-                                    new_tp_id = self.client.place_tp_market(
-                                        self.cfg.symbol,
-                                        side=tp_side,
-                                        stop_price=tp_stop,
-                                        position_side=tp_pos,
-                                    )
+                                    with self._lock:
+                                        new_tp_id = self.client.place_tp_market(
+                                            self.cfg.symbol,
+                                            side=tp_side,
+                                            stop_price=tp_stop,
+                                            position_side=tp_pos,
+                                        )
                                 except Exception as e:
                                     if "80001" in str(e):
                                         self._log(f"⚠️ 초기 TP 주문 실패: {e}")
@@ -773,14 +803,20 @@ class BotRunner:
 
                             # [PID capture] 포지션이 살아있는 동안 최신 positionId를 붙잡아 둔다
                             try:
-                                key = (self.cfg.symbol, self.cfg.side.upper())
+                                key = (self.bot_id, self.cfg.symbol, self.cfg.side.upper())
+                                
                                 pid_cache = getattr(self.client, "_last_position_id", {}).get(key)
 
-                                if not pid_cache:
-                                    pid_cache = getattr(self.client, "get_recent_position_id")(self.cfg.symbol, self.cfg.side, max_age_ms=120_000)
+                                if not pid_cache and hasattr(self.client, "get_recent_position_id"):
+                                    pid_cache = self.client.get_recent_position_id(self.cfg.symbol, self.cfg.side, max_age_ms=120_000)
+
+                                # 인라인 유효성 가드(숫자 + 12자리 이상)
+                                if pid_cache:
+                                    s = str(pid_cache).strip()
+                                    if not (s.isdigit() and len(s) >= 12):
+                                        pid_cache = None
 
                                 if pid_cache and qty_now_for_dca >= zero_eps:
-                                    # 다음 단계에서 쓸 수 있도록 두 곳 모두 갱신
                                     self.state.last_position_id = pid_cache
                                     self.state.recent_position_id = pid_cache
                             except Exception:
@@ -813,7 +849,8 @@ class BotRunner:
                             qty_now   = float(self.state.position_qty or 0.0)
 
                             try:
-                                open_orders = self.client.open_orders(self.cfg.symbol)
+                                with self._lock:
+                                    open_orders = self.client.open_orders(self.cfg.symbol)
                             except Exception as e:
                                 self._log(f"⚠️ 오픈오더 조회 실패: {e}")
                                 open_orders = []
@@ -842,7 +879,8 @@ class BotRunner:
 
                             if really_closed:
                                 try:
-                                    chk_avg, chk_qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
+                                    with self._lock:
+                                        chk_avg, chk_qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
                                 except Exception:
                                     chk_avg, chk_qty = 0.0, 0.0
 
@@ -852,7 +890,8 @@ class BotRunner:
                                         self._cancel_tracked_limits()
                                         if self.state.tp_order_id:
                                             try:
-                                                self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
+                                                with self._lock:
+                                                    self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
                                             except Exception:
                                                 pass
                                             self.state.tp_order_id = None
@@ -868,15 +907,17 @@ class BotRunner:
 
                                         if not pos_id:
                                             try:
-                                                _ = self.client.position_info(self.cfg.symbol, self.cfg.side)
+                                                with self._lock:
+                                                    _ = self.client.position_info(self.cfg.symbol, self.cfg.side)
                                             except Exception:
                                                 pass
+
                                             if hasattr(self.client, "get_recent_position_id"):
                                                 pos_id = self.client.get_recent_position_id(self.cfg.symbol, self.cfg.side, max_age_ms=120_000)
                                             if not pos_id:
                                                 try:
                                                     pos_id = getattr(self.client, "_last_position_id", {}).get(
-                                                        (self.cfg.symbol, self.cfg.side.upper())
+                                                        (self.bot_id, self.cfg.symbol, self.cfg.side.upper())   # ← bot_id 포함
                                                     )
                                                 except Exception:
                                                     pos_id = None
@@ -1034,7 +1075,8 @@ class BotRunner:
                                     continue
                                 if self.state.tp_order_id and tp_alive:
                                     try:
-                                        self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
+                                        with self._lock:
+                                            self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
                                         self._wait_cancel(self.state.tp_order_id, timeout=2.5)
                                     except Exception as e:
                                         self._log(f"⚠️ TP 취소 실패(무시): {e}")
@@ -1055,12 +1097,13 @@ class BotRunner:
                                 new_pos  = "LONG" if side == "BUY" else "SHORT"
 
                                 try:
-                                    new_id = self.client.place_tp_market(
-                                        self.cfg.symbol,
-                                        side=new_side,
-                                        stop_price=new_stop,
-                                        position_side=new_pos,
-                                    )
+                                    with self._lock:
+                                        new_id = self.client.place_tp_market(
+                                            self.cfg.symbol,
+                                            side=new_side,
+                                            stop_price=new_stop,
+                                            position_side=new_pos,
+                                        )
                                 except Exception as e:
                                     msg = str(e)
                                     if ("80001" in msg) or ("timed out" in msg.lower()):
@@ -1087,7 +1130,8 @@ class BotRunner:
                                 self._cancel_tracked_limits()
                                 if self.state.tp_order_id:
                                     try:
-                                        self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
+                                        with self._lock:
+                                            self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
                                     except Exception:
                                         pass
                                     self.state.tp_order_id = None
