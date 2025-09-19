@@ -363,6 +363,8 @@ class BingXClient:
         self._snap_block_until = 0.0
         self.log = logging.getLogger("bingx.client")
 
+        self._snap_lock = threading.RLock()
+
 
         try:
             _sync_server_time_once()
@@ -624,7 +626,7 @@ class BingXClient:
         return None
 
     def _fetch_user_balance_snapshot_usdt(self) -> dict:
-        url = f"{BASE}/openApi/swap/v2/user/balance"  
+        url = f"{BASE}/openApi/swap/v2/user/balance"
         self.log.debug("FETCH %s (block_until=%s now=%s)", url, self._snap_block_until, time.time())
         try:
             j = _req_get(url, {"recvWindow": 60000, "timestamp": _ts()}, signed=True)
@@ -637,10 +639,8 @@ class BingXClient:
                 for k in keys:
                     v = usdt.get(k)
                     if v is not None:
-                        try:
-                            return float(v)
-                        except Exception:
-                            pass
+                        try: return float(v)
+                        except: pass
                 return float(default)
 
             snap = {
@@ -651,55 +651,62 @@ class BingXClient:
                 "realised_profit":   f("realisedProfit", "realizedProfit"),
                 "unrealized_profit": f("unrealizedProfit", "unrealizedPnl", "uPnl"),
             }
-            self._snap_cache = snap
-            self._snap_ts = time.time()
-            self.log.debug(
-                "SNAPSHOT OK asset=%s bal=%.4f eq=%.4f avail=%.4f",
-                snap["asset"], snap["balance"], snap["equity"], snap["available_margin"]
-            )
+            with self._snap_lock:
+                self._snap_cache = snap
+                self._snap_ts = time.time()
+            self.log.debug("SNAPSHOT OK asset=%s bal=%.4f eq=%.4f avail=%.4f",
+                        snap["asset"], snap["balance"], snap["equity"], snap["available_margin"])
             return snap
-
         except Exception as e:
             unblock = self._parse_unblock_until_secs(str(e))
-            if unblock:
-                self._snap_block_until = max(self._snap_block_until, unblock)
-                self.log.warning("RATE LIMITED (100410), unblock_at=%s",
-                                 time.strftime("%H:%M:%S", time.localtime(self._snap_block_until)))
-            else:
-                self._snap_block_until = max(self._snap_block_until, time.time() + 30)
+            with self._snap_lock:
+                if unblock:
+                    self._snap_block_until = max(self._snap_block_until, unblock)
+                    self.log.warning("RATE LIMITED (100410), unblock_at=%s",
+                                    time.strftime("%H:%M:%S", time.localtime(self._snap_block_until)))
+                else:
+                    self._snap_block_until = max(self._snap_block_until, time.time() + 30)
             raise
 
-    def _get_snapshot_cached(self, min_ttl: float = 10.0) -> dict | None:
+    def _get_snapshot_cached(self, min_ttl: float = 10.0) -> dict:
         now = time.time()
-        if now < self._snap_block_until:
-            self.log.debug("using cache (rate-limited until %s)",
-                           time.strftime("%H:%M:%S", time.localtime(self._snap_block_until)))
-            return self._snap_cache
+        with self._snap_lock:
+            block_until = self._snap_block_until
+            snap = self._snap_cache
+            snap_ts = self._snap_ts
 
-        if self._snap_cache is not None and (now - self._snap_ts) < min_ttl:
-            self.log.debug("using fresh cache (age=%.1fs < ttl=%.1fs)", now - self._snap_ts, min_ttl)
-            return self._snap_cache
+        if now < block_until:
+            self.log.debug("using cache (rate-limited until %s)",
+                        time.strftime("%H:%M:%S", time.localtime(block_until)))
+            return snap or {}
+
+        if snap is not None and (now - snap_ts) < min_ttl:
+            self.log.debug("using fresh cache (age=%.1fs < ttl=%.1fs)", now - snap_ts, min_ttl)
+            return snap
 
         try:
             self.log.debug("cache stale or empty -> refetch")
             return self._fetch_user_balance_snapshot_usdt()
         except Exception as e:
             self.log.warning("refetch failed: %s; keep last snapshot", e)
-            return self._snap_cache
+            # 빈 딕셔너리를 반환해서 상위에서 .get(...)이 안전하도록
+            return snap or {}
 
-    
+        
     def get_accountbalance_usdt(self) -> float:
         snap = self._get_snapshot_cached(min_ttl=5.0)
-        return float(snap.get("balance", 0.0))
+        try: return float(snap.get("balance", 0.0))
+        except: return 0.0
 
     def get_equity_usdt(self) -> float:
         snap = self._get_snapshot_cached(min_ttl=5.0)
-        return float(snap.get("equity", 0.0))
+        try: return float(snap.get("equity", 0.0))
+        except: return 0.0
 
     def get_available_usdt(self) -> float:
         snap = self._get_snapshot_cached(min_ttl=5.0)
-        return float(snap.get("available_margin", 0.0))
-
+        try: return float(snap.get("available_margin", 0.0))
+        except: return 0.0
 
 
 

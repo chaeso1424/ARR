@@ -538,11 +538,13 @@ class BotRunner:
 
                         # 0) 가용 USDT 체크 (attach 모드면 패스 가능)
                         try:
-                            av = float(self.client.get_available_usdt())
+                            with self._lock:
+                                av = float(self.client.get_available_usdt())
                             if av < 0.99:  # 1차 조회 결과가 0에 가까움
                                 self._log("⚠️ 가용 USDT 0 → 재측정 시도")
                                 time.sleep(1)
-                                av = float(self.client.get_available_usdt())
+                                with self._lock:
+                                    av = float(self.client.get_available_usdt())
                         except Exception as e:
                             self._log(f"❌ 가용잔고 조회 실패: {e}")
                             av = 0.0
