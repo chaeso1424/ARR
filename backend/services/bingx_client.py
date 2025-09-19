@@ -346,30 +346,22 @@ def _make_cid(tag: str) -> str:
 
 # ---------- high-level client ----------
 class BingXClient:
-    def __init__(self, bot_id: str | None = None):
-        self.bot_id = bot_id
-        self._lock = threading.RLock()
-
-
-        # caches
+    def __init__(self):
         self._spec_cache: dict[str, dict] = {}
-        self._last_position: dict[tuple[str, str, str], tuple[float, float]] = {}
-        self._last_position_id: dict[tuple[str, str, str], str] = {}
-        self._last_position_id_ts: dict[tuple[str, str, str], int] = {}
+        self._last_position: dict[tuple[str, str], tuple[float, float]] = {}
 
-
-        self._snap_cache = None
-        self._snap_ts = 0.0
-        self._snap_block_until = 0.0
+        self._snap_cache = None            # 마지막 정상 스냅샷
+        self._snap_ts = 0.0                # 스냅샷 시각(epoch sec)
+        self._snap_block_until = 0.0       # 레이트리밋 해제 예정 시각(epoch sec)
         self.log = logging.getLogger("bingx.client")
 
-        self._snap_lock = threading.RLock()
 
-
+        # ✅ 시작 직후 1회 서버타임 동기화(실패해도 무시)
         try:
             _sync_server_time_once()
         except Exception:
             pass
+        
         self._start_initial_fetch()
 
     def get_current_leverage(self, symbol: str, side: str) -> float | None:
@@ -626,7 +618,7 @@ class BingXClient:
         return None
 
     def _fetch_user_balance_snapshot_usdt(self) -> dict:
-        url = f"{BASE}/openApi/swap/v2/user/balance"
+        url = f"{BASE}/openApi/swap/v2/user/balance"  
         self.log.debug("FETCH %s (block_until=%s now=%s)", url, self._snap_block_until, time.time())
         try:
             j = _req_get(url, {"recvWindow": 60000, "timestamp": _ts()}, signed=True)
@@ -639,8 +631,10 @@ class BingXClient:
                 for k in keys:
                     v = usdt.get(k)
                     if v is not None:
-                        try: return float(v)
-                        except: pass
+                        try:
+                            return float(v)
+                        except Exception:
+                            pass
                 return float(default)
 
             snap = {
@@ -651,62 +645,55 @@ class BingXClient:
                 "realised_profit":   f("realisedProfit", "realizedProfit"),
                 "unrealized_profit": f("unrealizedProfit", "unrealizedPnl", "uPnl"),
             }
-            with self._snap_lock:
-                self._snap_cache = snap
-                self._snap_ts = time.time()
-            self.log.debug("SNAPSHOT OK asset=%s bal=%.4f eq=%.4f avail=%.4f",
-                        snap["asset"], snap["balance"], snap["equity"], snap["available_margin"])
+            self._snap_cache = snap
+            self._snap_ts = time.time()
+            self.log.debug(
+                "SNAPSHOT OK asset=%s bal=%.4f eq=%.4f avail=%.4f",
+                snap["asset"], snap["balance"], snap["equity"], snap["available_margin"]
+            )
             return snap
+
         except Exception as e:
             unblock = self._parse_unblock_until_secs(str(e))
-            with self._snap_lock:
-                if unblock:
-                    self._snap_block_until = max(self._snap_block_until, unblock)
-                    self.log.warning("RATE LIMITED (100410), unblock_at=%s",
-                                    time.strftime("%H:%M:%S", time.localtime(self._snap_block_until)))
-                else:
-                    self._snap_block_until = max(self._snap_block_until, time.time() + 30)
+            if unblock:
+                self._snap_block_until = max(self._snap_block_until, unblock)
+                self.log.warning("RATE LIMITED (100410), unblock_at=%s",
+                                 time.strftime("%H:%M:%S", time.localtime(self._snap_block_until)))
+            else:
+                self._snap_block_until = max(self._snap_block_until, time.time() + 30)
             raise
 
-    def _get_snapshot_cached(self, min_ttl: float = 10.0) -> dict:
+    def _get_snapshot_cached(self, min_ttl: float = 10.0) -> dict | None:
         now = time.time()
-        with self._snap_lock:
-            block_until = self._snap_block_until
-            snap = self._snap_cache
-            snap_ts = self._snap_ts
-
-        if now < block_until:
+        if now < self._snap_block_until:
             self.log.debug("using cache (rate-limited until %s)",
-                        time.strftime("%H:%M:%S", time.localtime(block_until)))
-            return snap or {}
+                           time.strftime("%H:%M:%S", time.localtime(self._snap_block_until)))
+            return self._snap_cache
 
-        if snap is not None and (now - snap_ts) < min_ttl:
-            self.log.debug("using fresh cache (age=%.1fs < ttl=%.1fs)", now - snap_ts, min_ttl)
-            return snap
+        if self._snap_cache is not None and (now - self._snap_ts) < min_ttl:
+            self.log.debug("using fresh cache (age=%.1fs < ttl=%.1fs)", now - self._snap_ts, min_ttl)
+            return self._snap_cache
 
         try:
             self.log.debug("cache stale or empty -> refetch")
             return self._fetch_user_balance_snapshot_usdt()
         except Exception as e:
             self.log.warning("refetch failed: %s; keep last snapshot", e)
-            # 빈 딕셔너리를 반환해서 상위에서 .get(...)이 안전하도록
-            return snap or {}
+            return self._snap_cache
 
-        
+    
     def get_accountbalance_usdt(self) -> float:
         snap = self._get_snapshot_cached(min_ttl=5.0)
-        try: return float(snap.get("balance", 0.0))
-        except: return 0.0
+        return float(snap.get("balance", 0.0))
 
     def get_equity_usdt(self) -> float:
         snap = self._get_snapshot_cached(min_ttl=5.0)
-        try: return float(snap.get("equity", 0.0))
-        except: return 0.0
+        return float(snap.get("equity", 0.0))
 
     def get_available_usdt(self) -> float:
         snap = self._get_snapshot_cached(min_ttl=5.0)
-        try: return float(snap.get("available_margin", 0.0))
-        except: return 0.0
+        return float(snap.get("available_margin", 0.0))
+
 
 
 
@@ -980,15 +967,15 @@ class BingXClient:
         NOTE: positionId도 함께 파싱해 내부 캐시에 저장하지만, 반환값은 (entry, qty)로 유지합니다.
         """
         url = f"{BASE}/openApi/swap/v2/user/positions"
-        cache_key = (self.bot_id, str(symbol), str(side).upper())
+        cache_key = (str(symbol), str(side).upper())
 
-        with self._lock:
-            if not hasattr(self, "_last_position"):
-                self._last_position = {}
-            if not hasattr(self, "_last_position_id"):
-                self._last_position_id = {}
-            if not hasattr(self, "_last_position_id_ts"):
-                self._last_position_id_ts = {}
+        # 내부 캐시 초기화(최초 1회)
+        if not hasattr(self, "_last_position"):
+            self._last_position = {}
+        if not hasattr(self, "_last_position_id"):
+            self._last_position_id = {}
+        if not hasattr(self, "_last_position_id_ts"):
+            self._last_position_id_ts = {}
 
         # 네트워크 실패 시 기존 (entry, qty) 캐시 반환
         def _from_cache():
@@ -1015,9 +1002,9 @@ class BingXClient:
                 break
 
         if not pos:
-            with self._lock:
-                self._last_position[cache_key] = (0.0, 0.0)
-            return 0.0, 0.0
+            # 포지션 없음: 두 캐시 갱신
+            self._last_position[cache_key] = (0.0, 0.0)
+            return 0.0, 0.0 
 
         # entry (avg price)
         entry = 0.0
@@ -1050,20 +1037,24 @@ class BingXClient:
                 pid = str(v)
                 break
 
-        with self._lock:
-            self._last_position[cache_key] = (entry, qty)
-            if pid:
-                self._last_position_id[cache_key] = pid
-                self._last_position_id_ts[cache_key] = _now_ms()
+        self._last_position[cache_key] = (entry, qty)
+        if pid:
+            self._last_position_id[cache_key] = pid
+            self._last_position_id_ts[cache_key] = _now_ms()
 
         return entry, qty
     
     def get_recent_position_id(self, symbol: str, side: str, max_age_ms: int = 120_000) -> str | None:
-        key = (self.bot_id, str(symbol), str(side).upper())
-        with self._lock:
-            pid = self._last_position_id.get(key)
-            ts  = self._last_position_id_ts.get(key, 0)
+        """
+        포지션이 0이 된 뒤에도 '최근 max_age_ms 이내'에 본 positionId가 있으면 반환
+        """
+        if not hasattr(self, "_last_position_id") or not hasattr(self, "_last_position_id_ts"):
+            return None
+        key = (str(symbol), str(side).upper())
+        pid = self._last_position_id.get(key)
+        ts  = self._last_position_id_ts.get(key, 0)
         if pid and (_now_ms() - ts) <= max_age_ms:
             return pid
         return None
+
         
