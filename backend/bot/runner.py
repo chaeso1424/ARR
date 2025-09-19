@@ -717,7 +717,6 @@ class BotRunner:
 
                             # 4) 초기 TP 세팅
                             self._refresh_position()
-                            tick = 10 ** (-pp) if pp > 0 else 0.01
                             min_allowed = max(float(min_qty or 0.0), float(step or 0.0))
                             qty_now = float(self.state.position_qty or 0.0)
 
@@ -783,13 +782,16 @@ class BotRunner:
                             time.sleep(POLL_SEC)
                             self._refresh_position()
 
+                            # 포지션 수량변화 감지를 위한 스냅샷 inc
                             if not hasattr(self, "_prev_qty_snap"):
                                 self._prev_qty_snap = float(self.state.position_qty or 0.0)
                             prev_qty_snap = float(self._prev_qty_snap or 0.0)
 
-                            qty_now_for_dca = float(self.state.position_qty or 0.0)
+                            #최소 수량
                             min_allowed = max(float(min_qty or 0.0), float(step or 0.0))
                             zero_eps = min_allowed * ZERO_EPS_FACTOR
+
+                            # 포지션 수량 이전과 비교
                             inc = qty_now_for_dca - prev_qty_snap
 
                             # [PID capture] 포지션이 살아있는 동안 최신 positionId를 붙잡아 둔다
@@ -807,11 +809,18 @@ class BotRunner:
                             except Exception:
                                 pass
 
+                            # ----------------------------------- DCA record
+
+                            #DCA 체결 기록을 위한 포지션 수량
+                            qty_now_for_dca = float(self.state.position_qty or 0.0)
+
+                            #포지션 수량이 0보다 클 때, 현재 포지션 수량을 last nonzero qty에 덮어씀
                             if qty_now_for_dca > 0:
                                 self._last_nonzero_qty = qty_now_for_dca
 
-                            has_tracked_limits = bool(self.state.open_limit_ids)
-                            if has_tracked_limits and inc > zero_eps:
+                            # 집계 기준 / 수량이 반 step 이상의 변화일것
+                            if inc > zero_eps:
+                                # 집계
                                 try:
                                     dca_price = float(self.state.position_avg_price or 0.0) or float(mark)
                                     dca_qty = inc
@@ -829,6 +838,8 @@ class BotRunner:
                                     self._log(f"⚠️ DCA 집계 실패(무시): {_e}")
 
                             self._prev_qty_snap = qty_now_for_dca
+
+                            # ----------------------------------- DCA record
 
                             entry_now = float(self.state.position_avg_price or 0.0)
                             qty_now   = float(self.state.position_qty or 0.0)
@@ -852,7 +863,6 @@ class BotRunner:
                             did_cleanup = False
 
                             #--- 종료 판정
-                            tick = 10 ** (-pp) if pp > 0 else 0.01
                             min_allowed = max(float(min_qty or 0.0), float(step or 0.0))
                             zero_eps = min_allowed * ZERO_EPS_FACTOR
                             if qty_now < zero_eps:
