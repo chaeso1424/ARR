@@ -787,6 +787,9 @@ class BotRunner:
                                 self._prev_qty_snap = float(self.state.position_qty or 0.0)
                             prev_qty_snap = float(self._prev_qty_snap or 0.0)
 
+                            #DCA 체결 기록을 위한 포지션 수량
+                            qty_now_for_dca = float(self.state.position_qty or 0.0)
+
                             #최소 수량
                             min_allowed = max(float(min_qty or 0.0), float(step or 0.0))
                             zero_eps = min_allowed * ZERO_EPS_FACTOR
@@ -811,8 +814,6 @@ class BotRunner:
 
                             # ----------------------------------- DCA record
 
-                            #DCA 체결 기록을 위한 포지션 수량
-                            qty_now_for_dca = float(self.state.position_qty or 0.0)
 
                             #포지션 수량이 0보다 클 때, 현재 포지션 수량을 last nonzero qty에 덮어씀
                             if qty_now_for_dca > 0:
