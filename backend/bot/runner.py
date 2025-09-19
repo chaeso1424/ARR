@@ -538,6 +538,7 @@ class BotRunner:
 
                         # 0) 가용 USDT 체크 (attach 모드면 패스 가능)
                         try:
+                            time.sleep(0.2)
                             with self._lock:
                                 av = float(self.client.get_available_usdt())
                             if av < 0.99:  # 1차 조회 결과가 0에 가까움
@@ -1070,6 +1071,7 @@ class BotRunner:
                                 need_reset_tp = False
 
                             if need_reset_tp:
+                                self._log(f"new TP placed: orderId={self.sate.tp_order_id}")
                                 now_ts = self._now()
                                 if now_ts - last_tp_reset_ts < tp_reset_cooldown:
                                     continue
