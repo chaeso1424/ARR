@@ -1014,6 +1014,7 @@ class BotRunner:
                                     if cur_stop_f is not None:
                                         last_tp_price = cur_stop_f
                                         self._last_tp_price = cur_stop_f
+                                        self.state.tp_order_id = cur_id
                                     self._log(f"ℹ️ 기존 TP 감지/갱신: id={cur_id}, stopPrice={cur_stop_f}")
 
                                 # 이번 루프에선 확실히 TP 존재로 처리 (중복 생성 방지)
@@ -1059,6 +1060,17 @@ class BotRunner:
                                         self._wait_cancel(self.state.tp_order_id, timeout=2.5)
                                     except Exception as e:
                                         self._log(f"⚠️ TP 취소 실패(무시): {e}")
+
+                                if tp_equal_exists and tp_equal_id:
+                                    try:
+                                        self.client.cancel_order(self.cfg.symbol, tp_equal_id)
+                                        self._wait_cancel(tp_equal_id, timeout=2.5)
+                                        # 취소 반영 지연 대비, 아주 짧게 대기
+                                        time.sleep(0.3)
+                                    except Exception as e:
+                                        self._log(f"⚠️ 기존 TP 취소 실패(무시): {e}")
+                                        # 여기서 바로 새 TP를 넣기보단 한 턴 미루는게 안전하지만
+                                        # '해당 부분만' 수정 요구이므로 계속 진행
 
 
                                 if eff_entry <= 0 or qty_now < min_allowed:
