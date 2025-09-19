@@ -284,6 +284,69 @@ class BotRunner:
         self.state.position_avg_price = avg
         self.state.position_qty = qty
 
+    def _cancel_open_orders_sequential(self, interval: float = 1.0, rounds: int = 3,
+                                    filter_side: str | None = None,
+                                    filter_pos:  str | None = None) -> bool:
+        sym = self.cfg.symbol
+        for _ in range(max(1, rounds)):
+            try:
+                open_orders = self.client.open_orders(sym) or []
+            except Exception as e:
+                self._log(f"⚠️ 오픈오더 조회 실패: {e}")
+                return False
+
+            targets = []
+            for o in open_orders:
+                oid = o.get("orderId") or o.get("orderID") or o.get("id")
+                if not oid:
+                    continue
+
+                if filter_side:
+                    o_side = str(o.get("side") or o.get("orderSide") or "").upper()
+                    if o_side != filter_side.upper():
+                        continue
+
+                if filter_pos:
+                    o_pos = str(o.get("positionSide") or o.get("posSide") or o.get("position_side") or "").upper()
+                    if o_pos != filter_pos.upper():
+                        continue
+
+                targets.append(str(oid))
+
+            if not targets:
+                return True
+
+            for oid in targets:
+                try:
+                    self.client.cancel_order(sym, oid)
+                    self._log(f"🧹 오픈오더 취소: {oid}")
+                except Exception as e:
+                    m = str(e).lower()
+                    if any(k in m for k in ("80018","not exist","does not exist","unknown order","filled","canceled","cancelled")):
+                        self._log(f"ℹ️ 이미 정리됨: {oid}")
+                    else:
+                        self._log(f"⚠️ 오픈오더 취소 실패: {oid} {e}")
+                time.sleep(interval)
+            time.sleep(0.4)
+
+        # 최종 확인(필터 적용)
+        try:
+            remain = self.client.open_orders(sym) or []
+            for o in remain:
+                if filter_side:
+                    o_side = str(o.get("side") or o.get("orderSide") or "").upper()
+                    if o_side != filter_side.upper():
+                        continue
+                if filter_pos:
+                    o_pos = str(o.get("positionSide") or o.get("posSide") or o.get("position_side") or "").upper()
+                    if o_pos != filter_pos.upper():
+                        continue
+                return False   # 아직 남아있음
+            return True
+        except Exception:
+            return False
+
+
     def _cancel_tracked_limits(
         self,
         want_side: str | None = None,    # "BUY"/"SELL" (없으면 self.cfg.side)
@@ -508,15 +571,6 @@ class BotRunner:
                             entry_side = "BUY" if side == "BUY" else "SELL"
                             entry_pos  = "LONG" if side == "BUY" else "SHORT"
 
-                            ok = self._cancel_tracked_limits(
-                                want_side=entry_side,
-                                want_pos=entry_pos,
-                                attempts=3,
-                                verify_sleep=0.4
-                            )
-                            if not ok:
-                                self._log("⚠️ 엔트리 전 오류로 인한 잔여 리밋 정리 실패 ⚠️")
-                                break
 
                             if not self._lev_checked_this_cycle:
                                 try:
@@ -535,8 +589,18 @@ class BotRunner:
                                 finally:
                                     self._lev_checked_this_cycle = True
 
+                            # 시장가 진입전 잔여 오더 체크
+                            ok = self._cancel_open_orders_sequential(
+                                interval=1.0,
+                                rounds=3,
+                                filter_side=entry_side,                           # ← LONG 진입 시 BUY만 캔슬
+                                filter_pos=entry_pos if getattr(self.cfg, "hedge_mode", False) else None
+                            )
+                            if not ok:
+                                self._log("⚠️ 오픈오더 순차 취소 일부 실패(비치명적). 남은 주문이 진입에 간섭할 수 있음.")
+
+
                             # 2) 1차 시장가 진입
-                            self._cancel_tracked_limits()
                             first_usdt = float(self.cfg.dca_config[0][1])
                             target_notional = first_usdt * float(self.cfg.leverage)
                             raw_qty = target_notional / max(mark * contract, 1e-12)

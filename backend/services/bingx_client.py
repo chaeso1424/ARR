@@ -552,24 +552,6 @@ class BingXClient:
         raise last_err or RuntimeError("all order variants failed")
 
     # ----- Market / Quote -----
-    def list_symbols(self) -> list[str]:
-        """
-        거래가능 선물 심볼 목록. 실패시 안전 기본값 반환.
-        """
-        try:
-            url = f"{BASE}/openApi/swap/v2/quote/contracts"
-            j = _req_get(url)
-            data = j.get("data", [])
-            out = []
-            for it in data if isinstance(data, list) else []:
-                s = it.get("symbol") or it.get("contractCode") or it.get("symbolName")
-                if s and s.endswith("USDT"):
-                    out.append(s)
-            if out:
-                return sorted(set(out))
-        except Exception as e:
-            log(f"⚠️ list_symbols fallback: {e}")
-        return ["BTC-USDT", "ETH-USDT", "DOGE-USDT"]
 
     def get_last_price(self, symbol: str) -> float:
         """최신 체결가"""
