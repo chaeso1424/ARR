@@ -1071,7 +1071,7 @@ class BotRunner:
                                 need_reset_tp = False
 
                             if need_reset_tp:
-                                self._log(f"new TP placed: orderId={self.sate.tp_order_id}")
+                                self._log(f"new TP placed: orderId={self.state.tp_order_id}")
                                 now_ts = self._now()
                                 if now_ts - last_tp_reset_ts < tp_reset_cooldown:
                                     continue
