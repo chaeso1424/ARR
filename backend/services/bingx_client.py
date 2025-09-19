@@ -867,7 +867,7 @@ class BingXClient:
                         position_side: str|None=None,   # HEDGE 모드에서 LONG/SHORT 지정
                         ) -> str:
         """
-        TAKE_PROFIT_MARKET 조건부 시장가 익절 주문.
+        TAKE_PROFIT 조건부 시장가 익절 주문.
         항상 전체 청산(closePosition=true)으로만 전송합니다.
         """
         import time
@@ -878,13 +878,13 @@ class BingXClient:
         except Exception:
             raise RuntimeError("stop_price must be a number")
         if sp <= 0:
-            raise RuntimeError("stop_price must be > 0 for TAKE_PROFIT_MARKET")
+            raise RuntimeError("stop_price must be > 0 for TAKE_PROFIT")
 
         url = f"{BASE}/openApi/swap/v2/trade/order"
 
         base = {
             "symbol": symbol,
-            "type": "TAKE_PROFIT_MARKET",
+            "type": "TAKE_PROFIT",
             "stopPrice": sp,         # 들어온 값 그대로 사용
             "recvWindow": 60000,
             "timestamp": _ts(),
