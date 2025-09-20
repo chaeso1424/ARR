@@ -925,12 +925,18 @@ def start_bot(bot_id):
     runner.start()
     return jsonify({"ok": True, "msg": "started"})
 
-
 @app.post("/api/bots/<bot_id>/stop")
 def stop_bot(bot_id):
     r = get_redis()
-    r.set(desired_key(bot_id), "STOP")
+    # ✅ STOP 키는 영구가 아니라 짧은 TTL(예: 10초)로만 남긴다
+    try:
+        r.setex(desired_key(bot_id), 10, "STOP")
+    except Exception:
+        # setex 실패해도 Pub/Sub로는 전달
+        pass
     r.publish(ctl_channel(bot_id), "STOP")
+
+    # 상태 캐시 무효화
     STATUS_CACHE.pop(bot_id, None)
     _LAST_HB_SEEN.pop(bot_id, None)
     return jsonify({"ok": True, "msg": "stop signal broadcast"})

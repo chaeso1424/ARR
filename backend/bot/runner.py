@@ -203,27 +203,41 @@ class BotRunner:
         self._stop = False
         self._hb_stop = False
 
+        # Redis 핸들 확보
         try:
             self._r = get_redis()
         except Exception as e:
             self._r = None
             self._log(f"HB redis init fail (non-fatal): {e}")
 
+        # ✅ 오래된 STOP 플래그 제거 (핵심)
+        try:
+            if self._r:
+                self._r.delete(self._desired_key())
+        except Exception:
+            pass
+
+        # 중복 실행 방지 락 획득
         try:
             if self._r:
                 ok = self._r.set(self._lock_key(), self._lock_val(), nx=True, px=HB_TTL_SEC * 1000)
                 if not ok:
                     self._log("⛔ 실행 중으로 판단(락 보유자 존재) → start() 중단")
                     return
-
-                # 🔑 run-flag 등록 (owner = lock_val)
-                self._r.setex(f"bot:running:{self.bot_id}", HB_TTL_SEC, self._lock_val())
         except Exception as e:
             self._log(f"⚠️ 락 획득 실패(보수적으로 중단): {e}")
             return
 
+        # 스레드 기동: HB → LockKeeper → Control → Main
         now = time.time()
         self.state.last_heartbeat = now
+
+        # ✅ UI가 바로 running으로 보이도록 HB를 즉시 1회 기록
+        try:
+            if self._r:
+                self._r.setex(self._hbkey(), int(HB_TTL_SEC), json.dumps({"ts": now, "running": True}))
+        except Exception:
+            pass
 
         self._hb_thread = threading.Thread(target=self._hb_loop, daemon=True)
         self._hb_thread.start()
