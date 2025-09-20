@@ -110,7 +110,6 @@ class BotRunner:
                 time.sleep(1.0)
 
     def _lock_keeper(self):
-        """실행 중 락 TTL을 주기적으로 연장 (중복 실행 방지)."""
         try:
             r = self._r or get_redis()
         except Exception:
@@ -118,10 +117,11 @@ class BotRunner:
         while not self._hb_stop and not self._stop:
             if r:
                 try:
-                    # 락이 우리 소유일 때만 TTL 연장
                     v = r.get(self._lock_key())
                     if v and (v.decode() if isinstance(v, bytes) else v) == self._lock_val():
                         r.pexpire(self._lock_key(), HB_TTL_SEC * 1000)
+                        # 🔑 run-flag도 같이 TTL 연장
+                        r.pexpire(f"bot:running:{self.bot_id}", HB_TTL_SEC * 1000)
                 except Exception:
                     pass
             time.sleep(1.0)
@@ -194,7 +194,6 @@ class BotRunner:
 
                 time.sleep(0.2)
 
-
     def start(self):
         if self.state.running:
             self._log("ℹ️ 이미 실행 중")
@@ -203,7 +202,6 @@ class BotRunner:
         self._stop = False
         self._hb_stop = False
 
-        # Redis 핸들만 확보(락/소유권 개념 제거)
         try:
             self._r = get_redis()
         except Exception as e:
@@ -216,22 +214,22 @@ class BotRunner:
                 if not ok:
                     self._log("⛔ 실행 중으로 판단(락 보유자 존재) → start() 중단")
                     return
+
+                # 🔑 run-flag 등록 (owner = lock_val)
+                self._r.setex(f"bot:running:{self.bot_id}", HB_TTL_SEC, self._lock_val())
         except Exception as e:
             self._log(f"⚠️ 락 획득 실패(보수적으로 중단): {e}")
             return
 
-        # 스레드 기동: HB → Control → Main
         now = time.time()
         self.state.last_heartbeat = now
 
         self._hb_thread = threading.Thread(target=self._hb_loop, daemon=True)
         self._hb_thread.start()
 
-        # 락 TTL 유지 스레드 시작
         self._lock_thread = threading.Thread(target=self._lock_keeper, daemon=True)
         self._lock_thread.start()
 
-        #리스너
         self._ctl_thread = threading.Thread(target=self._control_listener, daemon=True)
         self._ctl_thread.start()
 
@@ -243,9 +241,9 @@ class BotRunner:
     def stop(self):
         self._stop = True
         self._hb_stop = True
+
         if hasattr(self, "_lock_thread") and self._lock_thread and self._lock_thread.is_alive():
             self._lock_thread.join(timeout=2)
-
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
         if self._hb_thread and self._hb_thread.is_alive():
@@ -260,10 +258,11 @@ class BotRunner:
             v = r.get(self._lock_key())
             if v and (v.decode() if isinstance(v, bytes) else v) == self._lock_val():
                 r.delete(self._lock_key())
+            # 🔑 run-flag 삭제
+            r.delete(f"bot:running:{self.bot_id}")
         except Exception:
             pass
 
-        # 종료 직전 HB에 running=false 마커만 남기고 끝
         try:
             r = get_redis()
             r.setex(self._hbkey(), 5, json.dumps({"ts": time.time(), "running": False}))
