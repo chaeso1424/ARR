@@ -652,6 +652,7 @@ def logs_text():
 # ───────────────────────────────────────────────────────────────────────────────
 
 # ---- HB / Control keys (HB-only design) ----
+
 def hb_key(bid: str) -> str:
     return f"bot:hb:{bid}"
 
@@ -718,8 +719,6 @@ def _ext_running_from_redis(
     _LAST_HB_SEEN[bot_id] = {"ts": hb_ts, "seen_at": now}
     return True, hb_ts
 
-
-
 def _get_status_live(cfg, state, timeout_each=0.7):
     s_all = Span("status_live")
     # 병렬 제출
@@ -785,9 +784,7 @@ def _get_status_live(cfg, state, timeout_each=0.7):
 def list_bots():
     """
     봇 목록 + 안정적인 running 판정:
-    - 메모리 state.running
     - Redis HB: hb.running=True AND (now-hb.ts) < HEARTBEAT_FRESH_SEC AND ts 증가 확인
-    둘 중 하나라도 True면 running 으로 간주.
     """
     HEARTBEAT_FRESH = float(os.getenv("HEARTBEAT_FRESH_SEC", "120"))
     s = Span("bots_list")
@@ -797,14 +794,8 @@ def list_bots():
         bot_id = f.stem
         cfg_data = read_bot_config(bot_id) or default_config(bot_id)
 
-        # 1) 메모리 기준
-        mem_running = bool(bot_id in BOTS and BOTS[bot_id]["state"].running)
-
-        # 2) Redis HB 기준
         hb, now = _read_redis_status(bot_id)
         ext_running, _ = _ext_running_from_redis(bot_id, hb, now, HEARTBEAT_FRESH)
-
-        running_effective = bool(mem_running or ext_running)
 
         out.append({
             "id": bot_id,
@@ -813,8 +804,8 @@ def list_bots():
             "side": cfg_data.get("side"),
             "margin_mode": cfg_data.get("margin_mode"),
             "leverage": cfg_data.get("leverage"),
-            "status": "running" if running_effective else "stopped",
-            "running": running_effective
+            "status": "running" if ext_running else "stopped",
+            "running": bool(ext_running)
         })
 
     d = s.end()
@@ -832,7 +823,6 @@ def list_bots():
         }]
 
     return jsonify(out)
-
 
 
 @app.post("/api/bots")
@@ -920,17 +910,14 @@ def start_bot(bot_id):
     runner.start()
     return jsonify({"ok": True, "msg": "started"})
 
+
 @app.post("/api/bots/<bot_id>/stop")
 def stop_bot(bot_id):
     r = get_redis()
-    # 1) 의사 저장
     r.set(desired_key(bot_id), "STOP")
-    # 2) 브로드캐스트 → 러너가 Pub/Sub로 즉시 수신
     r.publish(ctl_channel(bot_id), "STOP")
-    # 3) 캐시 무효화
     STATUS_CACHE.pop(bot_id, None)
     _LAST_HB_SEEN.pop(bot_id, None)
-    # 4) 즉시 성공 (비동기 종료)
     return jsonify({"ok": True, "msg": "stop signal broadcast"})
 
 
@@ -941,7 +928,6 @@ def status_bot(bot_id):
 
     now = time.time()
     HEARTBEAT_FRESH = float(os.getenv("HEARTBEAT_FRESH_SEC", "120"))
-    GRACE = float(os.getenv("RUNNING_GRACE_SEC", "60"))
 
     cache = STATUS_CACHE.get(bot_id)
     if cache and (now - cache["ts"] <= STATUS_TTL):
@@ -953,30 +939,17 @@ def status_bot(bot_id):
     except Exception:
         data = dict((cache or {}).get("data", {}))
 
-    # 1) 메모리 running
-    mem_running = bool(getattr(state, "running", False))
-
-    # 2) Redis HB 기준
+    # Redis HB 기준만으로 최종 판정
     hb, now2 = _read_redis_status(bot_id)
     ext_running, hb_ts = _ext_running_from_redis(bot_id, hb, now2, HEARTBEAT_FRESH)
 
-    # 3) 최종 판정 (+ 짧은 흔들림 GRACE)
-    effective_running = bool(mem_running or ext_running)
-    if not effective_running and cache and GRACE > 0:
-        prev = cache.get("data", {})
-        prev_ts = cache.get("ts", 0.0)
-        if (prev.get("running") is True or prev.get("effective_running") is True) and (now - prev_ts < GRACE):
-            effective_running = True
-
-    data["effective_running"] = effective_running
-    data["running"] = effective_running
+    data["effective_running"] = bool(ext_running)
+    data["running"] = bool(ext_running)
     data["last_heartbeat"] = hb_ts or float(getattr(state, "last_heartbeat", 0.0) or 0.0)
     data["heartbeat_age_sec"] = round(now - (data["last_heartbeat"] or 0.0), 3)
 
     STATUS_CACHE[bot_id] = {"ts": now, "data": data}
     return jsonify(data)
-
-
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 12) 디버그 & 로그인

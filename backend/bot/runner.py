@@ -69,6 +69,14 @@ class BotRunner:
 
     # ---------- lifecycle ----------
 
+    def _lock_key(self) -> str:
+        return f"bot:lock:{self.bot_id}"
+
+    def _lock_val(self) -> str:
+        # 프로세스 단위 구분 값 (pid 기반)
+        import os
+        return f"pid:{os.getpid()}"
+
     def _hbkey(self) -> str:
         return f"bot:hb:{self.bot_id}"
     
@@ -100,6 +108,23 @@ class BotRunner:
                         if miss % 10 == 1:
                             self._log(f"HB: redis set fail x{miss}: {e}")
                 time.sleep(1.0)
+
+    def _lock_keeper(self):
+        """실행 중 락 TTL을 주기적으로 연장 (중복 실행 방지)."""
+        try:
+            r = self._r or get_redis()
+        except Exception:
+            r = None
+        while not self._hb_stop and not self._stop:
+            if r:
+                try:
+                    # 락이 우리 소유일 때만 TTL 연장
+                    v = r.get(self._lock_key())
+                    if v and (v.decode() if isinstance(v, bytes) else v) == self._lock_val():
+                        r.pexpire(self._lock_key(), HB_TTL_SEC * 1000)
+                except Exception:
+                    pass
+            time.sleep(1.0)
 
     def _control_listener(self):
         """Redis Pub/Sub 로 STOP을 즉시 수신. 폴백으로 desired 키 폴링."""
@@ -138,7 +163,13 @@ class BotRunner:
                                 data = data.decode(errors="ignore")
                             if str(data).strip().upper() == "STOP":
                                 self._log("🛑 STOP via Pub/Sub")
+                                self._hb_stop = True
                                 self._stop = True
+                                try:
+                                    if r:
+                                        r.setex(self._hbkey(), 5, json.dumps({"ts": time.time(), "running": False}))
+                                except Exception:
+                                    pass
                                 break
                     except Exception:
                         pass
@@ -150,7 +181,12 @@ class BotRunner:
                         d = r.get(self._desired_key())
                         if d and d.decode(errors="ignore").upper() == "STOP":
                             self._log("🛑 STOP via desired key")
-                            self._stop = True
+                            self._hb_stop = True
+                            try:
+                                if r:
+                                    r.setex(self._hbkey(), 5, json.dumps({"ts": time.time(), "running": False}))
+                            except Exception:
+                                pass
                             break
                     except Exception:
                         pass
@@ -174,6 +210,16 @@ class BotRunner:
             self._r = None
             self._log(f"HB redis init fail (non-fatal): {e}")
 
+        try:
+            if self._r:
+                ok = self._r.set(self._lock_key(), self._lock_val(), nx=True, px=HB_TTL_SEC * 1000)
+                if not ok:
+                    self._log("⛔ 실행 중으로 판단(락 보유자 존재) → start() 중단")
+                    return
+        except Exception as e:
+            self._log(f"⚠️ 락 획득 실패(보수적으로 중단): {e}")
+            return
+
         # 스레드 기동: HB → Control → Main
         now = time.time()
         self.state.last_heartbeat = now
@@ -181,7 +227,11 @@ class BotRunner:
         self._hb_thread = threading.Thread(target=self._hb_loop, daemon=True)
         self._hb_thread.start()
 
-        # ⬇️ 새로 추가한 제어 리스너
+        # 락 TTL 유지 스레드 시작
+        self._lock_thread = threading.Thread(target=self._lock_keeper, daemon=True)
+        self._lock_thread.start()
+
+        #리스너
         self._ctl_thread = threading.Thread(target=self._control_listener, daemon=True)
         self._ctl_thread.start()
 
@@ -193,6 +243,8 @@ class BotRunner:
     def stop(self):
         self._stop = True
         self._hb_stop = True
+        if hasattr(self, "_lock_thread") and self._lock_thread and self._lock_thread.is_alive():
+            self._lock_thread.join(timeout=2)
 
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
@@ -202,6 +254,14 @@ class BotRunner:
             self._ctl_thread.join(timeout=2)
 
         self.state.running = False
+
+        try:
+            r = get_redis()
+            v = r.get(self._lock_key())
+            if v and (v.decode() if isinstance(v, bytes) else v) == self._lock_val():
+                r.delete(self._lock_key())
+        except Exception:
+            pass
 
         # 종료 직전 HB에 running=false 마커만 남기고 끝
         try:
@@ -1155,11 +1215,16 @@ class BotRunner:
                         continue
             finally:
                 self.state.running = False
-                # ⬇️ Redis도 정리
-                if getattr(self, "_r", None):
-                    try:
-                        # 종료 직전, 5초짜리 "정상 종료" 마커 남기기 (판독측이 부드럽게 전환)
+                try:
+                    if getattr(self, "_r", None):
+                        v = self._r.get(self._lock_key())
+                        if v and (v.decode() if isinstance(v, bytes) else v) == self._lock_val():
+                            self._r.delete(self._lock_key())
+                except Exception:
+                    pass
+                try:
+                    if getattr(self, "_r", None):
                         self._r.setex(self._hbkey(), 5, json.dumps({"ts": time.time(), "running": False}))
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
                 self._log("⏹️ 봇 종료")
