@@ -653,6 +653,17 @@ def logs_text():
 
 # ---- HB / Control keys (HB-only design) ----
 
+def lock_key(bid: str) -> str:
+    return f"bot:lock:{bid}"
+
+def _has_lock(bot_id: str) -> bool:
+    try:
+        r = get_redis()
+        v = r.get(lock_key(bot_id))
+        return bool(v)
+    except Exception:
+        return False
+
 def hb_key(bid: str) -> str:
     return f"bot:hb:{bid}"
 
@@ -797,6 +808,10 @@ def list_bots():
         hb, now = _read_redis_status(bot_id)
         ext_running, _ = _ext_running_from_redis(bot_id, hb, now, HEARTBEAT_FRESH)
 
+        # ✅ 락이 살아있으면 실행중으로 간주 (HB 보조판정)
+        lockalive = _has_lock(bot_id)
+        running_effective = bool(ext_running or lockalive)
+
         out.append({
             "id": bot_id,
             "name": cfg_data.get("name", bot_id),
@@ -804,8 +819,8 @@ def list_bots():
             "side": cfg_data.get("side"),
             "margin_mode": cfg_data.get("margin_mode"),
             "leverage": cfg_data.get("leverage"),
-            "status": "running" if ext_running else "stopped",
-            "running": bool(ext_running)
+            "status": "running" if running_effective else "stopped",
+            "running": running_effective
         })
 
     d = s.end()
@@ -943,8 +958,12 @@ def status_bot(bot_id):
     hb, now2 = _read_redis_status(bot_id)
     ext_running, hb_ts = _ext_running_from_redis(bot_id, hb, now2, HEARTBEAT_FRESH)
 
-    data["effective_running"] = bool(ext_running)
-    data["running"] = bool(ext_running)
+    # ✅ HB 또는 락 둘 중 하나라도 참이면 running
+    lockalive = _has_lock(bot_id)
+    effective_running = bool(ext_running or lockalive)
+
+    data["effective_running"] = effective_running
+    data["running"] = effective_running
     data["last_heartbeat"] = hb_ts or float(getattr(state, "last_heartbeat", 0.0) or 0.0)
     data["heartbeat_age_sec"] = round(now - (data["last_heartbeat"] or 0.0), 3)
 

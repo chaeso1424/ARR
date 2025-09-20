@@ -181,7 +181,9 @@ class BotRunner:
                         d = r.get(self._desired_key())
                         if d and d.decode(errors="ignore").upper() == "STOP":
                             self._log("🛑 STOP via desired key")
+                            # ✅ 하트비트 루프와 메인 루프 모두 멈추게 플래그를 올림
                             self._hb_stop = True
+                            self._stop = True
                             try:
                                 if r:
                                     r.setex(self._hbkey(), 5, json.dumps({"ts": time.time(), "running": False}))
@@ -191,9 +193,8 @@ class BotRunner:
                     except Exception:
                         pass
                     last_poll = now
-
                 time.sleep(0.2)
-
+                
     def start(self):
         if self.state.running:
             self._log("ℹ️ 이미 실행 중")
