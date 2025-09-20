@@ -38,8 +38,6 @@ HEARTBEAT_FRESH_SEC = float(os.getenv("HEARTBEAT_FRESH_SEC", "120"))
 STATUS_TTL = float(os.getenv("STATUS_TTL", "2.5"))
 RUNNING_GRACE_SEC = float(os.getenv("RUNNING_GRACE_SEC", "60"))
 
-RUN_FLAG_TTL_SEC    = 300     # run-flag TTL (HB 루프에서 계속 연장)
-
 _LAST_HB_SEEN = {}   # { bot_id: {"ts": float, "seen_at": float} }
 STUCK_DETECT_SEC = float(os.getenv("STUCK_DETECT_SEC", "6.0"))  # ts가 갱신 안 되고 6초 넘으면 죽은 것으로 간주
 
@@ -653,63 +651,60 @@ def logs_text():
 # 11) 다중 봇 API (병렬 수집 + 캐시 + 타이밍)
 # ───────────────────────────────────────────────────────────────────────────────
 
+# ---- HB / Control keys (HB-only design) ----
+def hb_key(bid: str) -> str:
+    return f"bot:hb:{bid}"
+
+def desired_key(bid: str) -> str:
+    return f"bot:desired:{bid}"
+
+def ctl_channel(bid: str) -> str:
+    return f"bot:control:{bid}"
+
 def _read_redis_status(bot_id: str):
-    """runkey/hb JSON을 읽고 표준화된 튜플을 반환한다.
-    returns: (run_owner: str|None, hb_obj: dict|None, now: float)
-    hb_obj 예시: {"ts": 1690000000.0, "owner": "...", "running": true/false}
-    (구버전 숫자 문자열도 허용)
-    """
+    """HB(JSON)만 읽어온다. returns: (hb_obj: dict|None, now: float)"""
     try:
         r = get_redis()
     except Exception:
-        return None, None, time.time()
+        return None, time.time()
 
-    run_key = f"bot:running:{bot_id}"
-    hb_key  = f"bot:hb:{bot_id}"
-
-    # runkey 값(현행은 owner 토큰)
-    run_owner = None
-    try:
-        v_run = r.get(run_key)
-        if v_run:
-            run_owner = v_run if isinstance(v_run, str) else v_run.decode("utf-8", "ignore")
-    except Exception:
-        run_owner = None
-
-    # hb(JSON) 읽기 + 구버전 숫자 호환
     hb_obj = None
     try:
-        v_hb = r.get(hb_key)
-        if v_hb:
-            s = v_hb if isinstance(v_hb, str) else v_hb.decode("utf-8", "ignore")
+        v = r.get(hb_key(bot_id))
+        if v:
+            s = v if isinstance(v, str) else v.decode("utf-8", "ignore")
             try:
-                hb_obj = json.loads(s)
+                hb_obj = json.loads(s)           # {"ts": float, "running": bool}
             except Exception:
+                # 구버전 숫자 문자열 호환
                 try:
-                    hb_obj = {"ts": float(s), "owner": None, "running": True}
+                    hb_obj = {"ts": float(s), "running": True}
                 except Exception:
                     hb_obj = None
     except Exception:
         hb_obj = None
 
-    return run_owner, hb_obj, time.time()
+    return hb_obj, time.time()
 
-def _ext_running_from_redis(bot_id: str, run_owner: str|None, hb: dict|None, now: float, heartbeat_fresh_sec: float) -> tuple[bool, float]:
-    """Redis 신호로 running 여부/마지막 ts 계산.
-    조건:
-      - owner 일치
+def _ext_running_from_redis(
+    bot_id: str,
+    hb: dict | None,
+    now: float,
+    heartbeat_fresh_sec: float
+) -> tuple[bool, float]:
+    """
+    HB 단일 근거:
       - hb.running == True
       - (now - hb.ts) < heartbeat_fresh_sec
-      - 추가: hb.ts가 STUCK_DETECT_SEC 동안 '증가'하지 않으면 False
+      - ts가 STUCK_DETECT_SEC 동안 '증가'하지 않으면 False
     """
-    if not (run_owner and hb and isinstance(hb, dict)):
+    if not (hb and isinstance(hb, dict)):
         return False, 0.0
 
     hb_ts = float(hb.get("ts") or 0.0)
-    hb_owner = hb.get("owner")
     hb_running = bool(hb.get("running", False))
 
-    if not (hb_owner == run_owner and hb_running):
+    if not hb_running:
         return False, hb_ts
 
     if not (hb_ts > 0.0 and (now - hb_ts) < heartbeat_fresh_sec):
@@ -722,6 +717,7 @@ def _ext_running_from_redis(bot_id: str, run_owner: str|None, hb: dict|None, now
 
     _LAST_HB_SEEN[bot_id] = {"ts": hb_ts, "seen_at": now}
     return True, hb_ts
+
 
 
 def _get_status_live(cfg, state, timeout_each=0.7):
@@ -788,12 +784,10 @@ def _get_status_live(cfg, state, timeout_each=0.7):
 @app.get("/api/bots")
 def list_bots():
     """
-    봇 목록 + 안정적인 running 판정 (CAS + 스턱 감지):
+    봇 목록 + 안정적인 running 판정:
     - 메모리 state.running
-    - Redis: runkey=owner, hb={"ts","owner","running"}
-    외부 신호 기준:
-      owner 일치 AND hb.running=True AND (now-hb.ts) < HEARTBEAT_FRESH_SEC AND (ts가 최근에 '증가'한 적 있음)
-    둘 중 하나(메모리 OR 외부신호)라도 True면 running으로 간주.
+    - Redis HB: hb.running=True AND (now-hb.ts) < HEARTBEAT_FRESH_SEC AND ts 증가 확인
+    둘 중 하나라도 True면 running 으로 간주.
     """
     HEARTBEAT_FRESH = float(os.getenv("HEARTBEAT_FRESH_SEC", "120"))
     s = Span("bots_list")
@@ -806,9 +800,9 @@ def list_bots():
         # 1) 메모리 기준
         mem_running = bool(bot_id in BOTS and BOTS[bot_id]["state"].running)
 
-        # 2) Redis 기준 (헬퍼로 일원화)
-        run_owner, hb, now = _read_redis_status(bot_id)
-        ext_running, _ = _ext_running_from_redis(bot_id, run_owner, hb, now, HEARTBEAT_FRESH)
+        # 2) Redis HB 기준
+        hb, now = _read_redis_status(bot_id)
+        ext_running, _ = _ext_running_from_redis(bot_id, hb, now, HEARTBEAT_FRESH)
 
         running_effective = bool(mem_running or ext_running)
 
@@ -831,12 +825,14 @@ def list_bots():
         cfg = default_config(DEFAULT_BOT_ID)
         write_bot_config(DEFAULT_BOT_ID, cfg)
         out = [{
-            "id": DEFAULT_BOT_ID, "name": DEFAULT_BOT_ID, "symbol": cfg["symbol"], "side": cfg["side"],
+            "id": DEFAULT_BOT_ID, "name": DEFAULT_BOT_ID,
+            "symbol": cfg["symbol"], "side": cfg["side"],
             "margin_mode": cfg["margin_mode"], "leverage": cfg["leverage"],
             "status": "stopped", "running": False
         }]
 
     return jsonify(out)
+
 
 
 @app.post("/api/bots")
@@ -919,44 +915,24 @@ def bot_config(bot_id):
 
 @app.post("/api/bots/<bot_id>/start")
 def start_bot(bot_id):
-    # Runner 준비
     bot = get_or_create_bot(bot_id)
     runner = bot["runner"]
-
-    # 선행 차단 금지: 실제 판정은 runner.start() 내부 CAS에 위임
     runner.start()
-
-    # 실행 결과 확인: runkey의 owner가 내 runner._owner와 일치하면 성공
-    try:
-        r = get_redis()
-        run_owner = r.get(runner._runkey())
-        if isinstance(run_owner, bytes):
-            run_owner = run_owner.decode("utf-8", "ignore")
-        if run_owner == runner._owner:
-            return jsonify({"ok": True, "msg": "started"})
-        else:
-            # 다른 인스턴스가 선점 중 (BUSY)
-            return jsonify({"ok": False, "msg": "busy (another owner)"}), 409
-    except Exception:
-        # Redis 점검이 실패해도, runner는 기동됐을 수 있으므로 낙관적으로 OK
-        return jsonify({"ok": True, "msg": "started (redis-check skipped)"}), 200
+    return jsonify({"ok": True, "msg": "started"})
 
 @app.post("/api/bots/<bot_id>/stop")
 def stop_bot(bot_id):
-    bot = get_or_create_bot(bot_id)
-    bot["runner"].stop()
+    r = get_redis()
+    # 1) 의사 저장
+    r.set(desired_key(bot_id), "STOP")
+    # 2) 브로드캐스트 → 러너가 Pub/Sub로 즉시 수신
+    r.publish(ctl_channel(bot_id), "STOP")
+    # 3) 캐시 무효화
+    STATUS_CACHE.pop(bot_id, None)
+    _LAST_HB_SEEN.pop(bot_id, None)
+    # 4) 즉시 성공 (비동기 종료)
+    return jsonify({"ok": True, "msg": "stop signal broadcast"})
 
-    # 🔧 상태 캐시/스턱 캐시 즉시 무효화 → /status가 바로 갱신되도록
-    try:
-        STATUS_CACHE.pop(bot_id, None)
-    except Exception:
-        pass
-    try:
-        _LAST_HB_SEEN.pop(bot_id, None)   # 스턱 감지 캐시도 초기화
-    except Exception:
-        pass
-
-    return jsonify({"ok": True})
 
 @app.get("/api/bots/<bot_id>/status")
 def status_bot(bot_id):
@@ -971,7 +947,7 @@ def status_bot(bot_id):
     if cache and (now - cache["ts"] <= STATUS_TTL):
         return jsonify(cache["data"])
 
-    # 라이브 수집
+    # 라이브 수집 (실패 시 캐시 폴백)
     try:
         data = _get_status_live(cfg, state)
     except Exception:
@@ -980,14 +956,12 @@ def status_bot(bot_id):
     # 1) 메모리 running
     mem_running = bool(getattr(state, "running", False))
 
-    # 2) Redis 외부 신호 (CAS + 스턱 감지) ← /bots와 동일 기준
-    run_owner, hb, now2 = _read_redis_status(bot_id)
-    ext_running, hb_ts = _ext_running_from_redis(bot_id, run_owner, hb, now2, HEARTBEAT_FRESH)
+    # 2) Redis HB 기준
+    hb, now2 = _read_redis_status(bot_id)
+    ext_running, hb_ts = _ext_running_from_redis(bot_id, hb, now2, HEARTBEAT_FRESH)
 
-    # 3) 최종 판정
+    # 3) 최종 판정 (+ 짧은 흔들림 GRACE)
     effective_running = bool(mem_running or ext_running)
-
-    # (옵션) 그레이스: 직전 true면 짧은 흔들림 무시
     if not effective_running and cache and GRACE > 0:
         prev = cache.get("data", {})
         prev_ts = cache.get("ts", 0.0)
@@ -1001,6 +975,7 @@ def status_bot(bot_id):
 
     STATUS_CACHE[bot_id] = {"ts": now, "data": data}
     return jsonify(data)
+
 
 
 # ───────────────────────────────────────────────────────────────────────────────

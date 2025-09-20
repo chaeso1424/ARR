@@ -15,14 +15,19 @@ from redis_helper import get_redis
 import os
 from services.v1_api import get_position_net_profit
 
+try:
+    from redis_helper import get_pubsub
+except Exception:
+    get_pubsub = None
+
 # ===== 운영 파라미터 =====
 RESTART_DELAY_SEC = int(os.getenv("RESTART_DELAY_SEC", "55"))   # TP 후 다음 사이클 대기
 CLOSE_ZERO_STREAK = int(os.getenv("CLOSE_ZERO_STREAK", "3"))    # 종료 판정에 필요한 연속 0회수
 ZERO_EPS_FACTOR   = float(os.getenv("ZERO_EPS_FACTOR", "0.5"))  # 0 판정 여유(최소단위의 50%)
 POLL_SEC          = 1.5
-HB_TTL_SEC        = 180  # 하트비트 TTL
-RUN_FLAG_TTL_SEC  = 180  # run-flag TTL
 
+#하트비트
+HB_TTL_SEC        = 180  # 하트비트 TTL
 
 class BotRunner:
     def __init__(self, cfg: BotConfig, state: BotState, client: BingXClient, bot_id: str):
@@ -34,9 +39,9 @@ class BotRunner:
         self._hb_thread = None
         self._hb_stop = False
         self._lev_checked_this_cycle = False
-        self._owner = f"{uuid.uuid4().hex}"
 
 
+        #봇별 아이디
         self.bot_id = bot_id
         base = Path(__file__).resolve().parents[1]  # 프로젝트 루트 기준 조정
 
@@ -63,14 +68,18 @@ class BotRunner:
         return self._log(msg)
 
     # ---------- lifecycle ----------
-    def _runkey(self) -> str:
-        return f"bot:running:{self.bot_id}"
 
     def _hbkey(self) -> str:
         return f"bot:hb:{self.bot_id}"
+    
+    def _ctl_channel(self) -> str:
+        return f"bot:control:{self.bot_id}"
+
+    def _desired_key(self) -> str:
+        return f"bot:desired:{self.bot_id}"
 
     def _hb_loop(self):
-        """메인 루프와 무관하게 1초마다 하트비트/러닝플래그를 Redis에 갱신."""
+        """메인 루프와 무관하게 1초마다 하트비트만 Redis에 갱신."""
         with bot_context(self.bot_id):
             try:
                 r = get_redis()
@@ -80,20 +89,75 @@ class BotRunner:
             miss = 0
             while not self._hb_stop:
                 ts = time.time()
-                # 메모리 하트비트도 매초 갱신 (같은 프로세스에서 즉시 참조 가능)
                 self.state.last_heartbeat = ts
-
                 if r:
                     try:
-                        r.setex(self._runkey(), int(RUN_FLAG_TTL_SEC), self._owner)
-                        r.setex(self._hbkey(), int(HB_TTL_SEC), json.dumps({"ts": ts, "owner": self._owner, "running": True}))
+                        # 오직 HB만! 존재 여부(=TTL)로 실행 여부를 판단하게 한다
+                        r.setex(self._hbkey(), int(HB_TTL_SEC), json.dumps({"ts": ts, "running": True}))
                         miss = 0
                     except Exception as e:
                         miss += 1
                         if miss % 10 == 1:
                             self._log(f"HB: redis set fail x{miss}: {e}")
-
                 time.sleep(1.0)
+
+    def _control_listener(self):
+        """Redis Pub/Sub 로 STOP을 즉시 수신. 폴백으로 desired 키 폴링."""
+        with bot_context(self.bot_id):
+            r = None
+            p = None
+            try:
+                r = get_redis()
+            except Exception:
+                pass
+
+            # Pub/Sub 우선
+            if get_pubsub is not None:
+                try:
+                    r, p = get_pubsub()
+                    p.subscribe(self._ctl_channel())
+                except Exception:
+                    p = None
+            else:
+                try:
+                    if r:
+                        p = r.pubsub()
+                        p.subscribe(self._ctl_channel())
+                except Exception:
+                    p = None
+
+            last_poll = 0.0
+            while not self._stop:
+                # 1) Pub/Sub 수신
+                if p is not None:
+                    try:
+                        msg = p.get_message(timeout=1.0)
+                        if msg and msg.get("type") == "message":
+                            data = msg.get("data")
+                            if isinstance(data, bytes):
+                                data = data.decode(errors="ignore")
+                            if str(data).strip().upper() == "STOP":
+                                self._log("🛑 STOP via Pub/Sub")
+                                self._stop = True
+                                break
+                    except Exception:
+                        pass
+
+                # 2) 폴백: desired 키 폴링 (2초마다)
+                now = time.time()
+                if r and (now - last_poll >= 2.0):
+                    try:
+                        d = r.get(self._desired_key())
+                        if d and d.decode(errors="ignore").upper() == "STOP":
+                            self._log("🛑 STOP via desired key")
+                            self._stop = True
+                            break
+                    except Exception:
+                        pass
+                    last_poll = now
+
+                time.sleep(0.2)
+
 
     def start(self):
         if self.state.running:
@@ -103,80 +167,28 @@ class BotRunner:
         self._stop = False
         self._hb_stop = False
 
+        # Redis 핸들만 확보(락/소유권 개념 제거)
         try:
-            r = get_redis()
-            now  = int(time.time())
-            stale_sec = max(int(HB_TTL_SEC) + 60, 240)
-
-            script = """
-            local runkey = KEYS[1]
-            local hbkey  = KEYS[2]
-            local owner  = ARGV[1]
-            local now    = tonumber(ARGV[2])
-            local hbttl  = tonumber(ARGV[3])
-            local rttl   = tonumber(ARGV[4])
-            local stale  = tonumber(ARGV[5])
-
-            local cur = redis.call("GET", runkey)
-            if not cur then
-            redis.call("SETEX", runkey, rttl, owner)
-            redis.call("SETEX", hbkey,  hbttl, cjson.encode({ts=now, owner=owner, running=true}))
-            return "TAKEN"
-            end
-
-            local hb = redis.call("GET", hbkey)
-            if not hb then
-            redis.call("SETEX", runkey, rttl, owner)
-            redis.call("SETEX", hbkey,  hbttl, cjson.encode({ts=now, owner=owner, running=true}))
-            return "TAKEN_NOHB"
-            end
-
-            local ok, obj = pcall(cjson.decode, hb)
-            if not ok then
-            redis.call("SETEX", runkey, rttl, owner)
-            redis.call("SETEX", hbkey,  hbttl, cjson.encode({ts=now, owner=owner, running=true}))
-            return "TAKEN_BADHB"
-            end
-
-            if obj.running == false then
-            redis.call("SETEX", runkey, rttl, owner)
-            redis.call("SETEX", hbkey,  hbttl, cjson.encode({ts=now, owner=owner, running=true}))
-            return "TAKEN_ENDED"
-            end
-
-            local ts = tonumber(obj.ts or 0)
-            if ts <= 0 or (now - ts) > stale then
-            redis.call("SETEX", runkey, rttl, owner)
-            redis.call("SETEX", hbkey,  hbttl, cjson.encode({ts=now, owner=owner, running=true}))
-            return "TAKEN_STALE"
-            end
-
-            return "BUSY"
-            """
-
-            res = r.eval(
-                script, 2,
-                self._runkey(), self._hbkey(),
-                self._owner, str(now), str(HB_TTL_SEC), str(RUN_FLAG_TTL_SEC), str(stale_sec)
-            )
-            if str(res).startswith("BUSY"):
-                self._log("⛔ 다른 인스턴스가 실행 중으로 판단(BUSY). 시작 중단.")
-                return
-            else:
-                self._log(f"🔑 소유권 확보: {res}")
-            self._r = r
+            self._r = get_redis()
         except Exception as e:
             self._r = None
-            self._log(f"HB owner-takeover init fail (non-fatal): {e}")
+            self._log(f"HB redis init fail (non-fatal): {e}")
 
-        # ⬇️ 여기부터 기존처럼 하트비트/메인 스레드 기동
+        # 스레드 기동: HB → Control → Main
         now = time.time()
         self.state.last_heartbeat = now
+
         self._hb_thread = threading.Thread(target=self._hb_loop, daemon=True)
         self._hb_thread.start()
+
+        # ⬇️ 새로 추가한 제어 리스너
+        self._ctl_thread = threading.Thread(target=self._control_listener, daemon=True)
+        self._ctl_thread.start()
+
         self._thread = threading.Thread(target=self._run, daemon=True)
         self.state.running = True
         self._thread.start()
+
 
     def stop(self):
         self._stop = True
@@ -186,31 +198,15 @@ class BotRunner:
             self._thread.join(timeout=5)
         if self._hb_thread and self._hb_thread.is_alive():
             self._hb_thread.join(timeout=2)
+        if hasattr(self, "_ctl_thread") and self._ctl_thread and self._ctl_thread.is_alive():
+            self._ctl_thread.join(timeout=2)
 
         self.state.running = False
 
+        # 종료 직전 HB에 running=false 마커만 남기고 끝
         try:
             r = get_redis()
-            script = """
-            local runkey = KEYS[1]
-            local hbkey  = KEYS[2]
-            local owner  = ARGV[1]
-
-            local cur = redis.call("GET", runkey)
-            if cur and cur == owner then
-            redis.call("DEL", runkey)
-            end
-
-            local hb = redis.call("GET", hbkey)
-            if hb then
-            local ok, obj = pcall(cjson.decode, hb)
-            if ok and obj and obj.owner == owner then
-                redis.call("SETEX", hbkey, 5, cjson.encode({ts=redis.call("TIME")[1], owner=owner, running=false}))
-            end
-            end
-            return 1
-            """
-            r.eval(script, 2, self._runkey(), self._hbkey(), self._owner)
+            r.setex(self._hbkey(), 5, json.dumps({"ts": time.time(), "running": False}))
         except Exception as e:
             self._log(f"HB cleanup fail (non-fatal): {e}")
 
